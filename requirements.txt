@@ -1,0 +1,4 @@
+# Runtime dependency for the ingestion tasks.
+# In docker this is installed via _PIP_ADDITIONAL_REQUIREMENTS (see .env / docker-compose).
+# Listed here so the DAG also runs in a plain (non-docker) Airflow environment.
+requests>=2.31,<3

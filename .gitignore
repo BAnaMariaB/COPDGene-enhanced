@@ -216,3 +216,23 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ── COPD ingestion project ─────────────────────────────────────────────
+# Local Airflow home from `airflow standalone` (non-docker dev)
+.airflow/
+airflow.cfg
+airflow.db
+webserver_config.py
+standalone_admin_password.txt
+
+# Airflow task logs (docker mounts ./logs)
+logs/
+
+# Raw zone: generated at runtime, can be large — keep the folder, ignore contents
+data/**
+!data/
+!data/raw/
+!data/raw/.gitkeep
+
+# macOS
+.DS_Store

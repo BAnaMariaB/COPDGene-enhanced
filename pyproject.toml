@@ -1,0 +1,31 @@
+[project]
+name = "copd-ingestion"
+version = "0.1.0"
+description = "COPD data ingestion pipeline — Airflow DAG landing raw sources (CSV/JSON/HTML) into a date-partitioned raw zone."
+readme = "README.md"
+requires-python = ">=3.11,<3.12"
+
+# Runtime dependency the DAG actually imports.
+# NOTE: Airflow itself is NOT listed here — it's provided by the Docker image in
+# prod, and installed separately for local dev via Apache's constraints file
+# (see requirements-dev.txt). Keeping it out of the lock keeps uv.lock small and
+# avoids Airflow's heavy resolution.
+dependencies = [
+    # Range (not a hard pin) so it's compatible with Airflow's own requests pin
+    # (2.31.x) during local dev, and won't get force-downgraded.
+    "requests>=2.31,<3",
+]
+
+[dependency-groups]
+# Local dev tooling, managed by uv and captured in uv.lock.
+dev = [
+    "ruff>=0.5,<0.6",
+]
+
+[tool.uv]
+# This is an Airflow DAGs project, not an installable library — don't build/install it.
+package = false
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
