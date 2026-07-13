@@ -59,13 +59,41 @@ runs, the raw files appear under `./data/raw/<source>/<date>/` on your machine.
 
 Stop everything with `docker compose down` (add `-v` to also wipe the metadata DB).
 
+## Run it locally with your existing `~/airflow` install
+
+Use the helper script to keep the pipeline outputs inside the project
+directory while reusing the Airflow home you already have:
+
+```bash
+cd copd-ingestion
+bash scripts/run_airflow_local.sh
+```
+
+That setup keeps Airflow metadata under `~/airflow/` and writes pipeline output
+directly into the repo:
+
+- `./data/raw/...`
+- `./data/preprocessed/...`
+- `./data/artifacts/...`
+
+If you need to reset a broken local Airflow state, run:
+
+```bash
+bash scripts/reset_airflow_local.sh
+```
+
+That clears the Airflow home in `~/airflow/` and removes generated output under
+`./data/` so the next run starts clean.
+
 ## Run the DAG in an existing Airflow
 
 If you already have Airflow, just drop `dags/copd_ingestion.py` into your
 `dags/` folder and ensure `requests` is installed. Set where files land with:
 
 ```bash
-export COPD_RAW_ROOT=/your/raw/zone   # defaults to /opt/airflow/data/raw
+export COPD_RAW_ROOT=/your/raw/zone
+export COPD_PREPROCESSED_ROOT=/your/preprocessed/zone
+export COPD_ARTIFACT_ROOT=/your/artifacts/zone
 ```
 
 ## Design notes
@@ -73,9 +101,9 @@ export COPD_RAW_ROOT=/your/raw/zone   # defaults to /opt/airflow/data/raw
 - **Schedule** — runs **hourly** (`0 * * * *`). It ships **paused** by default
   (`DAGS_ARE_PAUSED_AT_CREATION=true`); un-pause it once in the UI and it then
   triggers itself every hour. `catchup=False` means no backfill of missed hours.
-- **One DAG, three parallel tasks** (`ingest_demographics`, `ingest_imaging`,
-  `ingest_spirometry`) fan out from a `start` marker and fan back into an
-  `ingestion_complete` marker so downstream DAGs can depend on a single task.
+- **One DAG, three parallel ingest tasks** fan out from a `start` marker and
+  fan back into preprocessing, then into an `ingestion_complete` marker so
+  downstream DAGs can depend on a single task.
 - **Idempotent per run date** — re-running a date overwrites that partition, so
   retries and backfills are safe.
 - **Retries** — 3 task retries (Airflow) plus 3 per-request HTTP retries.
