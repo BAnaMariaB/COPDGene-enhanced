@@ -14,6 +14,9 @@ dependencies = [
     # Range (not a hard pin) so it's compatible with Airflow's own requests pin
     # (2.31.x) during local dev, and won't get force-downgraded.
     "requests>=2.31,<3",
+    "pandas>=2.2,<3",
+    "scikit-learn>=1.5,<2",
+    "joblib>=1.4,<2",
 ]
 
 [dependency-groups]
