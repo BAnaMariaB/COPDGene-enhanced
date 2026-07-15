@@ -6,10 +6,14 @@ published and lands them, unmodified, into a date-partitioned raw zone. It does
 NOT parse, clean, validate schemas, or join the sources — that is downstream work
 owned by other team members.
 
-Sources (all keyed by `sid`):
-  - demographics : CSV
-  - imaging      : JSON
-  - spirometry   : HTML (contains an HTML <table>)
+Core sources (all keyed by `sid`, merged downstream):
+  - demographics : CSV  (static file download)
+  - imaging      : JSON (static file download)
+  - spirometry   : HTML (static file download; contains an HTML <table>)
+
+Context sources (population-level, NOT keyed by `sid`, landed raw only):
+  - cdc_copd_prevalence : JSON (live CDC Socrata SODA API)
+  - smoking_prevalence  : HTML (web scrape of a Wikipedia article)
 
 Landing layout (one partition per DAG run date):
   data/raw/<source>/<YYYY-MM-DD>/<source>.<ext>
@@ -66,13 +70,46 @@ SOURCES = {
     },
 }
 
+# Additional "context" sources added to satisfy the project's multi-source,
+# multi-method ingestion requirement (live API + web scrape, from other websites).
+#
+# IMPORTANT: these are POPULATION-LEVEL (national / state / country) and are NOT
+# keyed by `sid`. They are landed raw here for provenance, but are deliberately
+# NOT merged into the sid-level dataset by the preprocessing step — there is no
+# join key. Downstream may use them for coarse context features only.
+#
+#   - cdc_copd_prevalence : live REST API pull (CDC Socrata SODA), JSON
+#   - smoking_prevalence  : web scrape of an HTML page (tables parsed downstream)
+CONTEXT_SOURCES = {
+    "cdc_copd_prevalence": {
+        # CDC U.S. Chronic Disease Indicators, filtered to COPD (topicid=COPD).
+        # SODA API returns JSON; $limit is set high enough to return all COPD rows.
+        "url": "https://data.cdc.gov/resource/hksd-2xuw.json?topicid=COPD&$limit=50000",
+        "ext": "json",
+        "kind": "api",
+    },
+    "smoking_prevalence": {
+        # Wikipedia article containing tobacco-use prevalence tables.
+        "url": "https://en.wikipedia.org/wiki/Prevalence_of_tobacco_use",
+        "ext": "html",
+        "kind": "web_scrape",
+    },
+}
+
 
 # ---------------------------------------------------------------------------
 # Ingestion logic
 # ---------------------------------------------------------------------------
 
 @task
-def ingest_source(source_name: str, url: str, ext: str, ds: str = None, run_id: str = None) -> str:
+def ingest_source(
+    source_name: str,
+    url: str,
+    ext: str,
+    source_kind: str = "download",
+    ds: str = None,
+    run_id: str = None,
+) -> str:
     """Download one raw source and land it, byte-for-byte, in the raw zone.
 
     Returns the path of the landed file (also pushed to XCom automatically).
@@ -113,6 +150,7 @@ def ingest_source(source_name: str, url: str, ext: str, ds: str = None, run_id: 
     metadata = {
         "source_name": source_name,
         "source_url": url,
+        "ingestion_kind": source_kind,
         "http_status": resp.status_code,
         "content_type": resp.headers.get("Content-Type"),
         "content_length_reported": resp.headers.get("Content-Length"),
@@ -284,21 +322,42 @@ def copd_ingestion():
         source_name="demographics",
         url=SOURCES["demographics"]["url"],
         ext=SOURCES["demographics"]["ext"],
+        source_kind="static_file",
     )
     imaging_task = ingest_source(
         source_name="imaging",
         url=SOURCES["imaging"]["url"],
         ext=SOURCES["imaging"]["ext"],
+        source_kind="static_file",
     )
     spirometry_task = ingest_source(
         source_name="spirometry",
         url=SOURCES["spirometry"]["url"],
         ext=SOURCES["spirometry"]["ext"],
+        source_kind="static_file",
     )
+
+    # Context sources: landed raw only, one task each (explicit task_id per source).
+    # They are NOT passed into preprocessing because they have no `sid` join key.
+    context_tasks = [
+        ingest_source.override(task_id=f"ingest_{name}")(
+            source_name=name,
+            url=cfg["url"],
+            ext=cfg["ext"],
+            source_kind=cfg["kind"],
+        )
+        for name, cfg in CONTEXT_SOURCES.items()
+    ]
+
     preprocessing_task = preprocessing(demographics_task, imaging_task, spirometry_task)
     complete_task = ingestion_complete(preprocessing_task)
 
+    # Core path: 3 sid-keyed sources -> merge/preprocess -> complete.
     start_task >> [demographics_task, imaging_task, spirometry_task] >> preprocessing_task >> complete_task
+    # Context path: parallel raw landings that also gate completion (no merge).
+    start_task >> context_tasks
+    for context_task in context_tasks:
+        context_task >> complete_task
 
 
 copd_dag = copd_ingestion()
