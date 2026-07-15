@@ -46,6 +46,9 @@ RAW_ROOT = os.environ.get("COPD_RAW_ROOT", os.path.join(AIRFLOW_HOME, "data", "r
 # HTTP settings
 REQUEST_TIMEOUT = 60          # seconds
 REQUEST_MAX_RETRIES = 3       # handled by Airflow task retries too; this is per-call
+# Some sites (e.g. Wikipedia) reject the default python-requests User-Agent with
+# HTTP 403, so we send a descriptive one. Being a good scraping citizen too.
+USER_AGENT = "COPDGene-ingestion/0.1 (student project; contact: team)"
 
 # Preprocessing artifacts are stored separately from raw landing data.
 ARTIFACT_ROOT = os.environ.get("COPD_ARTIFACT_ROOT", os.path.join(AIRFLOW_HOME, "data", "artifacts"))
@@ -126,6 +129,7 @@ def ingest_source(
 
     # Download the raw bytes.
     session = requests.Session()
+    session.headers.update({"User-Agent": USER_AGENT})
     last_err = None
     for attempt in range(1, REQUEST_MAX_RETRIES + 1):
         try:
