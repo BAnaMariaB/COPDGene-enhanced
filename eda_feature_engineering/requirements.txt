@@ -1,0 +1,8 @@
+# Deps for this staging folder only -- not yet merged into the project's
+# main pyproject.toml, since it's not confirmed whether this logic ends up
+# inside the Airflow DAG (which manages its own deps separately).
+requests>=2.31,<3
+pandas>=2.2,<3
+lxml
+scipy>=1.11,<2
+matplotlib>=3.8,<4

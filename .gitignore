@@ -55,6 +55,9 @@ cover/
 *.mo
 *.pot
 
+mlflow.db
+mlruns
+
 # Django stuff:
 *.log
 local_settings.py
@@ -234,10 +237,11 @@ data/**
 !data/raw/
 !data/raw/.gitkeep
 
-# MLflow experiment tracking (generated locally)
-mlflow.db
-mlruns/
-uv.lock
+# EDA & feature-engineering staging area — generated raw copies/outputs, keep folder structure only
+eda_feature_engineering/raw/**
+!eda_feature_engineering/raw/.gitkeep
+eda_feature_engineering/output/**
+!eda_feature_engineering/output/.gitkeep
 
 # macOS
 .DS_Store

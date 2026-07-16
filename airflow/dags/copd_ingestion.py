@@ -1,20 +1,26 @@
 """
 COPD data ingestion DAG.
 
-SCOPE: ingest the real NHANES 2011-2012 primary dataset, build a COPD cohort with
-derived clinical features, and produce a preprocessed dataset for the training DAG.
+SCOPE: ingestion only. This DAG pulls three raw source files exactly as they are
+published and lands them, unmodified, into a date-partitioned raw zone. It does
+NOT parse, clean, validate schemas, or join the sources — that is downstream work
+owned by other team members.
 
-Sources (all keyed by `SEQN`):
-  - DEMO_G : demographics (age, sex, race/ethnicity)
-  - SPX_G  : spirometry (FVC, FEV1, quality flags)
-  - BMX_G  : body measures (height, weight, BMI)
-  - SMQ_G  : smoking questionnaire (status, pack-years)
+Core sources (all keyed by `sid`, merged downstream):
+  - demographics : CSV  (static file download)
+  - imaging      : JSON (static file download)
+  - spirometry   : HTML (static file download; contains an HTML <table>)
 
-The NHANES files are downloaded once to a shared raw zone. A downstream task then
-merges them, filters to adults with acceptable spirometry, derives clinically
-meaningful features (FEV1/FVC ratio, FEV1 % predicted, GOLD stage, BMI category,
-age group, pack-years), and writes the preprocessed dataset with two target
-columns: `copd_diagnosis` and `gold_stage`.
+Context sources (population-level, NOT keyed by `sid`, landed raw only):
+  - cdc_copd_prevalence : JSON (live CDC Socrata SODA API)
+  - smoking_prevalence  : HTML (web scrape of a Wikipedia article)
+
+Landing layout (one partition per DAG run date):
+  data/raw/<source>/<YYYY-MM-DD>/<source>.<ext>
+  data/raw/<source>/<YYYY-MM-DD>/<source>.<ext>.meta.json   (ingestion metadata sidecar)
+
+The three source tasks run in parallel; a final `ingestion_complete` marker task
+fans them back in so downstream DAGs can depend on a single point.
 """
 
 from __future__ import annotations
@@ -23,18 +29,10 @@ import hashlib
 import json
 import os
 import socket
-import sys
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 
 import requests
 from airflow.sdk import dag, task
-
-# Allow the DAG to import the standalone NHANES cohort builder in scripts/.
-_PROJECT_ROOT = Path(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
-_SCRIPTS_DIR = _PROJECT_ROOT / "scripts"
-if str(_SCRIPTS_DIR) not in sys.path:
-    sys.path.insert(0, str(_SCRIPTS_DIR))
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -48,6 +46,9 @@ RAW_ROOT = os.environ.get("COPD_RAW_ROOT", os.path.join(AIRFLOW_HOME, "data", "r
 # HTTP settings
 REQUEST_TIMEOUT = 60          # seconds
 REQUEST_MAX_RETRIES = 3       # handled by Airflow task retries too; this is per-call
+# Some sites (e.g. Wikipedia) reject the default python-requests User-Agent with
+# HTTP 403, so we send a descriptive one. Being a good scraping citizen too.
+USER_AGENT = "COPDGene-ingestion/0.1 (student project; contact: team)"
 
 # Preprocessing artifacts are stored separately from raw landing data.
 ARTIFACT_ROOT = os.environ.get("COPD_ARTIFACT_ROOT", os.path.join(AIRFLOW_HOME, "data", "artifacts"))
@@ -56,28 +57,7 @@ PREPROCESSED_ROOT = os.environ.get(
     os.path.join(AIRFLOW_HOME, "data", "preprocessed"),
 )
 
-# NHANES 2011-2012 primary source files. These are real CDC data files used to
-# build a custom COPD cohort, replacing the previous public teaching files.
-NHANES_SOURCES = {
-    "DEMO_G": {
-        "url": "https://wwwn.cdc.gov/Nchs/Data/Nhanes/Public/2011/DataFiles/DEMO_G.xpt",
-        "ext": "xpt",
-    },
-    "SPX_G": {
-        "url": "https://wwwn.cdc.gov/Nchs/Data/Nhanes/Public/2011/DataFiles/SPX_G.xpt",
-        "ext": "xpt",
-    },
-    "BMX_G": {
-        "url": "https://wwwn.cdc.gov/Nchs/Data/Nhanes/Public/2011/DataFiles/BMX_G.xpt",
-        "ext": "xpt",
-    },
-    "SMQ_G": {
-        "url": "https://wwwn.cdc.gov/Nchs/Data/Nhanes/Public/2011/DataFiles/SMQ_G.xpt",
-        "ext": "xpt",
-    },
-}
-
-# Legacy teaching sources (kept for reference, no longer used by default).
+# Each source: logical name -> (url, file extension)
 SOURCES = {
     "demographics": {
         "url": "https://raw.githubusercontent.com/khasenst/datasets_teaching/refs/heads/main/copd_data_demographics.csv",
@@ -93,13 +73,46 @@ SOURCES = {
     },
 }
 
+# Additional "context" sources added to satisfy the project's multi-source,
+# multi-method ingestion requirement (live API + web scrape, from other websites).
+#
+# IMPORTANT: these are POPULATION-LEVEL (national / state / country) and are NOT
+# keyed by `sid`. They are landed raw here for provenance, but are deliberately
+# NOT merged into the sid-level dataset by the preprocessing step — there is no
+# join key. Downstream may use them for coarse context features only.
+#
+#   - cdc_copd_prevalence : live REST API pull (CDC Socrata SODA), JSON
+#   - smoking_prevalence  : web scrape of an HTML page (tables parsed downstream)
+CONTEXT_SOURCES = {
+    "cdc_copd_prevalence": {
+        # CDC U.S. Chronic Disease Indicators, filtered to COPD (topicid=COPD).
+        # SODA API returns JSON; $limit is set high enough to return all COPD rows.
+        "url": "https://data.cdc.gov/resource/hksd-2xuw.json?topicid=COPD&$limit=50000",
+        "ext": "json",
+        "kind": "api",
+    },
+    "smoking_prevalence": {
+        # Wikipedia article containing tobacco-use prevalence tables.
+        "url": "https://en.wikipedia.org/wiki/Prevalence_of_tobacco_use",
+        "ext": "html",
+        "kind": "web_scrape",
+    },
+}
+
 
 # ---------------------------------------------------------------------------
 # Ingestion logic
 # ---------------------------------------------------------------------------
 
 @task
-def ingest_source(source_name: str, url: str, ext: str, ds: str = None, run_id: str = None) -> str:
+def ingest_source(
+    source_name: str,
+    url: str,
+    ext: str,
+    source_kind: str = "download",
+    ds: str = None,
+    run_id: str = None,
+) -> str:
     """Download one raw source and land it, byte-for-byte, in the raw zone.
 
     Returns the path of the landed file (also pushed to XCom automatically).
@@ -116,6 +129,7 @@ def ingest_source(source_name: str, url: str, ext: str, ds: str = None, run_id: 
 
     # Download the raw bytes.
     session = requests.Session()
+    session.headers.update({"User-Agent": USER_AGENT})
     last_err = None
     for attempt in range(1, REQUEST_MAX_RETRIES + 1):
         try:
@@ -140,6 +154,7 @@ def ingest_source(source_name: str, url: str, ext: str, ds: str = None, run_id: 
     metadata = {
         "source_name": source_name,
         "source_url": url,
+        "ingestion_kind": source_kind,
         "http_status": resp.status_code,
         "content_type": resp.headers.get("Content-Type"),
         "content_length_reported": resp.headers.get("Content-Length"),
@@ -174,13 +189,13 @@ default_args = {
 
 @dag(
     dag_id="copd_ingestion",
-    description="Ingest NHANES 2011-2012 sources and build a COPD cohort with derived clinical features.",
+    description="Ingest raw COPD sources (CSV/JSON/HTML) into a date-partitioned raw zone. Ingestion only.",
     default_args=default_args,
     start_date=datetime(2024, 1, 1),
     schedule="0 * * * *",  # hourly, at the top of every hour
     catchup=False,
     max_active_runs=1,
-    tags=["copd", "ingestion", "nhanes", "cohort", "raw"],
+    tags=["copd", "ingestion", "raw"],
 )
 def copd_ingestion():
     @task
@@ -188,53 +203,22 @@ def copd_ingestion():
         """Explicit start marker for readability in the task graph."""
 
     @task
-    def nhanes_ingest() -> list[str]:
-        """Ensure the four NHANES 2011-2012 XPT files are present in the raw zone."""
-        from airflow.sdk import get_current_context
+    def preprocessing(demographics_path: str, imaging_path: str, spirometry_path: str) -> str:
+        """Merge and transform the three core sid-keyed sources only.
 
-        context = get_current_context()
-        ds = context["ds"]
-        nhanes_raw_dir = Path(RAW_ROOT) / "nhanes" / ds
-        nhanes_raw_dir.mkdir(parents=True, exist_ok=True)
+        Context sources (cdc_copd_prevalence, smoking_prevalence) are deliberately
+        excluded because they are population-level and have no `sid` join key. The
+        output is a clean, model-ready matrix plus reusable sklearn artifacts.
 
-        downloaded = []
-        for source_name, cfg in NHANES_SOURCES.items():
-            dest_path = nhanes_raw_dir / f"{source_name}.{cfg['ext']}"
-            if not dest_path.exists():
-                # Re-use the same download logic as ingest_source.
-                session = requests.Session()
-                for attempt in range(1, REQUEST_MAX_RETRIES + 1):
-                    try:
-                        resp = session.get(cfg["url"], timeout=REQUEST_TIMEOUT)
-                        resp.raise_for_status()
-                        break
-                    except requests.RequestException as err:
-                        if attempt == REQUEST_MAX_RETRIES:
-                            raise
-                dest_path.write_bytes(resp.content)
-                print(f"[nhanes] downloaded {source_name}: {len(resp.content)} bytes")
-            else:
-                print(f"[nhanes] using existing {source_name}")
-            downloaded.append(str(dest_path))
-        return downloaded
-
-    @task
-    def build_cohort(nhanes_paths: list[str]) -> str:
-        """Build the NHANES COPD cohort and return the cohort CSV path."""
-        import build_nhanes_cohort as cohort_builder
-
-        cohort_builder.RAW_DIR = Path(nhanes_paths[0]).parent
-        cohort_builder.COHORT_DIR = Path(PREPROCESSED_ROOT)
-        cohort = cohort_builder.build_cohort()
-        cohort_path = cohort_builder.COHORT_DIR / "nhanes_copd_cohort.csv"
-        cohort_builder.COHORT_DIR.mkdir(parents=True, exist_ok=True)
-        cohort.to_csv(cohort_path, index=False)
-        print(f"[cohort] built {len(cohort)} rows -> {cohort_path}")
-        return str(cohort_path)
-
-    @task
-    def preprocessing(cohort_path: str) -> str:
-        """Impute missing values, encode categoricals, and scale numerics."""
+        Steps:
+        1. Load the three core sources and validate their schemas.
+        2. Outer-merge on `sid`.
+        3. Drop leakage / non-feature columns (`sid`, `visit_date`, `respiratory`).
+        4. One-hot encode categoricals (`gender`, `race`, `smoking_status`) and
+           median-impute + standard-scale numeric columns.
+        5. Persist the central preprocessed dataset, the fitted preprocessor, and
+           a JSON preprocessing manifest.
+        """
         from airflow.sdk import get_current_context
         import joblib
         import pandas as pd
@@ -248,22 +232,101 @@ def copd_ingestion():
         preprocessed_dir = os.path.join(PREPROCESSED_ROOT, ds)
         os.makedirs(preprocessed_dir, exist_ok=True)
 
-        cohort = pd.read_csv(cohort_path)
+        # Expected schemas for the three core sid-keyed sources. These are the only
+        # columns allowed in the final merged dataset; anything else is treated as
+        # schema drift and rejected. This guards against context-source columns or
+        # future upstream changes leaking into the sid-level model matrix.
+        EXPECTED_COLUMNS = {
+            "demographics": {
+                "sid",
+                "visit_year",
+                "visit_date",
+                "visit_age",
+                "gender",
+                "race",
+                "smoking_status",
+                "height_cm",
+                "weight_kg",
+                "blood_pressure_systolic",
+                "blood_pressure_diastolic",
+                "heart_rate",
+                "hours_on_oxygen",
+                "bmi",
+                "smoke_start_age",
+                "cigs_per_day_avg",
+                "duration_smoking",
+                "respiratory",
+            },
+            "imaging": {
+                "sid",
+                "lung_volume_inspiratory",
+                "emphysema_percentage",
+                "lung_volume_expiratory",
+                "gas_trapping_percentage",
+                "mean_density_inspiratory",
+                "mean_density_expiratory",
+            },
+            "spirometry": {
+                "sid",
+                "fev1_fvc_ratio",
+                "fev1",
+                "fvc",
+                "fev1_phase2",
+            },
+        }
 
-        # Targets are kept as-is in the output for the training DAG to consume.
-        target_cols = ["copd_diagnosis", "gold_stage"]
-        for col in target_cols:
-            if col not in cohort.columns:
-                raise ValueError(f"Target column '{col}' not found in NHANES cohort")
+        def _validate_source(name: str, df: pd.DataFrame) -> None:
+            expected = EXPECTED_COLUMNS[name]
+            actual = set(df.columns)
+            missing = expected - actual
+            extra = actual - expected
+            if missing:
+                raise ValueError(
+                    f"{name} is missing required columns: {sorted(missing)}"
+                )
+            if extra:
+                raise ValueError(
+                    f"{name} has unexpected columns that are not present in the "
+                    f"expected schema for the other core sources: {sorted(extra)}"
+                )
 
-        # SEQN is the unique identifier and must not leak into features.
-        leakage_cols = ["SEQN"]
-        feature_df = cohort.drop(columns=leakage_cols + target_cols, errors="ignore")
+        demographics = pd.read_csv(demographics_path)
+        imaging = pd.read_json(imaging_path)
+        spirometry = pd.read_html(spirometry_path)[0]
 
+        _validate_source("demographics", demographics)
+        _validate_source("imaging", imaging)
+        _validate_source("spirometry", spirometry)
+
+        merged = demographics.merge(
+            imaging, on="sid", how="outer", suffixes=("_demographics", "_imaging")
+        )
+        merged = merged.merge(
+            spirometry, on="sid", how="outer", suffixes=("", "_spirometry")
+        )
+
+        if "sid" not in merged.columns:
+            raise ValueError("merged dataset does not contain required sid column")
+
+        # Columns that are not model features. `sid` is a leakage key; `visit_date`
+        # is a non-numeric string; `respiratory` is a pipe-delimited free-text field
+        # that would need a dedicated text-encoding step. None of these are present
+        # in imaging or spirometry, so they are explicitly excluded from the model
+        # matrix to keep the dataset aligned with the columns that all three sources
+        # can contribute.
+        DROP_REASONS = {
+            "sid": "subject identifier / leakage key",
+            "visit_date": "non-informative string column, not present in other sources",
+            "respiratory": "pipe-delimited free-text, not present in other sources",
+        }
+        dropped_feature_cols = [col for col in DROP_REASONS if col in merged.columns]
+        feature_df = merged.drop(columns=dropped_feature_cols, errors="ignore")
+
+        lower_columns = {col.lower(): col for col in feature_df.columns}
         categorical_cols = [
-            col
-            for col in feature_df.columns
-            if feature_df[col].dtype.name in ("category", "object")
+            lower_columns[name]
+            for name in ("gender", "race", "smoking_status")
+            if name in lower_columns
         ]
         numeric_cols = [
             col
@@ -273,7 +336,7 @@ def copd_ingestion():
         ]
 
         if not categorical_cols and not numeric_cols:
-            raise ValueError("no usable feature columns found in NHANES cohort")
+            raise ValueError("no usable feature columns found after applying the ColumnTransformer rules")
 
         preprocessor = ColumnTransformer(
             transformers=[
@@ -305,51 +368,93 @@ def copd_ingestion():
             verbose_feature_names_out=False,
         )
 
-        X_array = preprocessor.fit_transform(feature_df)
-        X_columns = preprocessor.get_feature_names_out()
-        # XGBoost rejects feature names containing brackets or angle brackets.
-        X_columns_clean = [
-            col.replace("[", "_").replace("]", "_").replace("<", "_").replace(">", "_")
-            for col in X_columns
-        ]
-        X_df = pd.DataFrame(X_array, columns=X_columns_clean, index=feature_df.index)
+        preprocessed_array = preprocessor.fit_transform(feature_df)
+        preprocessed_columns = preprocessor.get_feature_names_out()
+        preprocessed_df = pd.DataFrame(preprocessed_array, columns=preprocessed_columns, index=feature_df.index)
 
-        # Add the raw targets back so the training DAG can split them.
-        preprocessed_df = pd.concat([X_df, cohort[target_cols].reset_index(drop=True)], axis=1)
+        artifact_path = os.path.join(preprocessed_dir, "preprocessing_artifacts.joblib")
+        summary_path = os.path.join(preprocessed_dir, "preprocessing_artifacts.json")
+        manifest_path = os.path.join(preprocessed_dir, "preprocessing_manifest.json")
+        central_dataset_path = os.path.join(preprocessed_dir, "central_preprocessed_dataset.csv")
 
         artifacts = {
             "preprocessor": preprocessor,
             "numeric_columns": numeric_cols,
             "categorical_columns": categorical_cols,
-            "dropped_leakage_columns": leakage_cols,
-            "target_columns": target_cols,
-            "source_path": cohort_path,
+            "dropped_columns": {
+                "leakage": ["sid"],
+                "non_feature": ["visit_date", "respiratory"],
+                "all": dropped_feature_cols,
+                "reasons": DROP_REASONS,
+            },
+            "source_paths": {
+                "demographics": demographics_path,
+                "imaging": imaging_path,
+                "spirometry": spirometry_path,
+            },
             "partition_ds": ds,
+            "central_dataset_path": central_dataset_path,
+            "manifest_path": manifest_path,
+            "summary_path": summary_path,
         }
-
-        artifact_path = os.path.join(preprocessed_dir, "preprocessing_artifacts.joblib")
         joblib.dump(artifacts, artifact_path)
 
-        summary_path = os.path.join(preprocessed_dir, "preprocessing_artifacts.json")
         with open(summary_path, "w", encoding="utf-8") as fh:
             json.dump(
                 {
                     "artifact_path": artifact_path,
                     "numeric_columns": numeric_cols,
                     "categorical_columns": categorical_cols,
-                    "dropped_leakage_columns": leakage_cols,
-                    "target_columns": target_cols,
+                    "dropped_columns": artifacts["dropped_columns"],
                     "partition_ds": ds,
-                    "n_rows": len(preprocessed_df),
-                    "n_feature_columns": len(X_columns_clean),
                 },
                 fh,
                 indent=2,
             )
 
-        central_dataset_path = os.path.join(preprocessed_dir, "central_preprocessed_dataset.csv")
+        with open(manifest_path, "w", encoding="utf-8") as fh:
+            json.dump(
+                {
+                    "partition_ds": ds,
+                    "source_paths": artifacts["source_paths"],
+                    "expected_columns": {k: sorted(v) for k, v in EXPECTED_COLUMNS.items()},
+                    "actual_columns": {
+                        "demographics": sorted(demographics.columns.tolist()),
+                        "imaging": sorted(imaging.columns.tolist()),
+                        "spirometry": sorted(spirometry.columns.tolist()),
+                    },
+                    "context_sources_excluded": [
+                        "cdc_copd_prevalence",
+                        "smoking_prevalence",
+                    ],
+                    "context_sources_exclusion_reason": (
+                        "population-level sources with no sid join key; "
+                        "they are landed raw but not merged into the sid-level dataset"
+                    ),
+                    "merged_shape": merged.shape,
+                    "dropped_columns": artifacts["dropped_columns"],
+                    "feature_columns": {
+                        "categorical": categorical_cols,
+                        "numeric": numeric_cols,
+                    },
+                    "preprocessed_shape": preprocessed_df.shape,
+                    "preprocessed_columns": preprocessed_columns.tolist(),
+                    "output_files": {
+                        "central_dataset": central_dataset_path,
+                        "artifacts": artifact_path,
+                        "summary": summary_path,
+                    },
+                },
+                fh,
+                indent=2,
+            )
+
         preprocessed_df.to_csv(central_dataset_path, index=False)
 
+        print(
+            f"[preprocess] merged={merged.shape} -> features={feature_df.shape} "
+            f"-> preprocessed={preprocessed_df.shape} -> {central_dataset_path}"
+        )
         return artifact_path
 
     @task
@@ -358,12 +463,46 @@ def copd_ingestion():
         print(f"[preprocess] artifacts saved at {preprocessing_artifacts_path}")
 
     start_task = start()
-    nhanes_paths = nhanes_ingest()
-    cohort_path = build_cohort(nhanes_paths)
-    preprocessing_task = preprocessing(cohort_path)
+    demographics_task = ingest_source(
+        source_name="demographics",
+        url=SOURCES["demographics"]["url"],
+        ext=SOURCES["demographics"]["ext"],
+        source_kind="static_file",
+    )
+    imaging_task = ingest_source(
+        source_name="imaging",
+        url=SOURCES["imaging"]["url"],
+        ext=SOURCES["imaging"]["ext"],
+        source_kind="static_file",
+    )
+    spirometry_task = ingest_source(
+        source_name="spirometry",
+        url=SOURCES["spirometry"]["url"],
+        ext=SOURCES["spirometry"]["ext"],
+        source_kind="static_file",
+    )
+
+    # Context sources: landed raw only, one task each (explicit task_id per source).
+    # They are NOT passed into preprocessing because they have no `sid` join key.
+    context_tasks = [
+        ingest_source.override(task_id=f"ingest_{name}")(
+            source_name=name,
+            url=cfg["url"],
+            ext=cfg["ext"],
+            source_kind=cfg["kind"],
+        )
+        for name, cfg in CONTEXT_SOURCES.items()
+    ]
+
+    preprocessing_task = preprocessing(demographics_task, imaging_task, spirometry_task)
     complete_task = ingestion_complete(preprocessing_task)
 
-    start_task >> nhanes_paths >> cohort_path >> preprocessing_task >> complete_task
+    # Core path: 3 sid-keyed sources -> merge/preprocess -> complete.
+    start_task >> [demographics_task, imaging_task, spirometry_task] >> preprocessing_task >> complete_task
+    # Context path: parallel raw landings that also gate completion (no merge).
+    start_task >> context_tasks
+    for context_task in context_tasks:
+        context_task >> complete_task
 
 
 copd_dag = copd_ingestion()
