@@ -234,5 +234,10 @@ data/**
 !data/raw/
 !data/raw/.gitkeep
 
+# MLflow experiment tracking (generated locally)
+mlflow.db
+mlruns/
+uv.lock
+
 # macOS
 .DS_Store
