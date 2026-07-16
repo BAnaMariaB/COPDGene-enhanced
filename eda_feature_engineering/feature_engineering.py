@@ -1,8 +1,21 @@
-"""Feature engineering for the FEV1 prediction target.
+"""Feature engineering for the COPD dataset.
 
-Produces a feature-engineered dataframe (still unencoded/unscaled — see
-README.md for why encoding is deliberately left as an open question) plus a
-written manifest documenting every decision made along the way.
+The team has NOT finalized a single prediction target yet. Per
+`DATA_PREPROCESSING.md` (written by whoever owns preprocessing) plus our own
+earlier EDA, there are three live candidates:
+
+  - `fev1`            -- baseline FEV1 (current lung function). Regression.
+  - `fev1_phase2`      -- FEV1 measured five years after baseline (per the
+                          spirometry data dictionary: "FEV1 five years
+                          later"). Regression -- predicts lung-function
+                          decline, not a repeat of the baseline test.
+  - `gold_copd`        -- derived: `fev1_fvc_ratio < 0.70` (the GOLD
+                          diagnostic criterion for airflow obstruction).
+                          Classification.
+
+Rather than guessing which one wins, this module builds a leakage-correct,
+target-ready dataset for all three, so whichever gets picked is already sitting
+in `output/` with the right columns dropped.
 """
 
 from __future__ import annotations
@@ -13,18 +26,63 @@ import pandas as pd
 
 from paths import OUTPUT_DIR
 
-TARGET = "fev1"
-
-# See eda.py for the reasoning — these two let a model reconstruct FEV1
-# almost exactly rather than predict it.
-LEAKAGE_COLUMNS = ["fev1_fvc_ratio", "fev1_phase2"]
-
 CATEGORICAL_COLUMNS = ["gender", "race", "smoking_status"]
 
 # `respiratory` is pipe-delimited multi-label free text, e.g.
-# "hay fever|bronchitis attacks|pneumonia" — NOT a single category. ~25.6% of
-# rows have no value reported.
+# "hay fever|bronchitis attacks|pneumonia" -- NOT a single category. ~25.6% of
+# rows have no value reported. NOTE: the shared ingestion DAG's `preprocessing`
+# task (airflow/dags/copd_ingestion.py) drops this column entirely rather than
+# parsing it -- our parsed flags are an intentional addition on top of that.
 RESPIRATORY_COLUMN = "respiratory"
+
+GOLD_THRESHOLD = 0.70
+
+# For each candidate target: which OTHER columns must be dropped from the
+# feature set, and why. Columns not listed here are safe to keep as features
+# for that target. `sid` is never a feature for any target -- it's kept in
+# the output CSV for traceability only (see README.md).
+TARGET_CANDIDATES = {
+    "fev1": {
+        "kind": "regression",
+        "description": "Baseline FEV1 (current lung function).",
+        "excluded_features": ["fev1_fvc_ratio", "fev1_phase2", "gold_copd"],
+        "exclusion_reasoning": {
+            "fev1_fvc_ratio": "fev1 = fev1_fvc_ratio * fvc almost exactly -> direct leakage.",
+            "fev1_phase2": (
+                "measured five years after baseline -> not available at "
+                "prediction time for a baseline target (it's a separate "
+                "candidate target, not a feature)."
+            ),
+            "gold_copd": "derived from fev1_fvc_ratio, which already leaks fev1 -> same leakage, one step removed.",
+        },
+    },
+    "fev1_phase2": {
+        "kind": "regression",
+        "description": "FEV1 measured five years after baseline -- predicts lung-function decline.",
+        "excluded_features": [],
+        "exclusion_reasoning": {
+            "_none": (
+                "fev1, fvc, fev1_fvc_ratio, and gold_copd are all baseline "
+                "values known before the 5-year follow-up, so they're "
+                "legitimate predictors here -- no leakage."
+            ),
+        },
+    },
+    "gold_copd": {
+        "kind": "classification",
+        "description": f"GOLD criterion: fev1_fvc_ratio < {GOLD_THRESHOLD} (airflow obstruction).",
+        "excluded_features": ["fev1_fvc_ratio", "fev1", "fev1_phase2"],
+        "exclusion_reasoning": {
+            "fev1_fvc_ratio": "this is the exact value the label is thresholded from -- direct leakage.",
+            "fev1": (
+                "fev1 + fvc together reconstruct fev1_fvc_ratio exactly, so the "
+                "label is deterministically recoverable if both are kept -- "
+                "drop fev1, keep fvc alone as the spirometry input."
+            ),
+            "fev1_phase2": "measured five years after baseline -- not available at prediction time.",
+        },
+    },
+}
 
 
 def _split_conditions(value) -> list[str]:
@@ -48,7 +106,7 @@ def engineer_features(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
     out["air_trapping_ratio"] = out["lung_volume_expiratory"] / out["lung_volume_inspiratory"]
 
     # Multi-label respiratory history -> one boolean flag per distinct
-    # condition (NOT one flag per pipe-combo — a naive value_counts().head(N)
+    # condition (NOT one flag per pipe-combo -- a naive value_counts().head(N)
     # would treat "hay fever|pneumonia" as its own category, which is wrong).
     out["respiratory_reported"] = out[RESPIRATORY_COLUMN].notna()
     condition_lists = out[RESPIRATORY_COLUMN].apply(_split_conditions)
@@ -60,28 +118,26 @@ def engineer_features(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
         out[col_name] = condition_lists.apply(lambda conds, c=condition: c in conds)
         engineered_respiratory_cols.append(col_name)
 
+    # Derived classification target candidate: GOLD criterion. Preserve NaN
+    # for rows with missing fev1_fvc_ratio instead of silently coercing them
+    # to False (`NaN < 0.70` is False in pandas, which would be wrong here).
+    ratio = out["fev1_fvc_ratio"]
+    out["gold_copd"] = (ratio < GOLD_THRESHOLD).astype("boolean")
+    out.loc[ratio.isna(), "gold_copd"] = pd.NA
+
     for col in CATEGORICAL_COLUMNS:
         out[col] = out[col].astype("category")
 
-    dropped_for_leakage = [c for c in LEAKAGE_COLUMNS if c in out.columns]
-
     manifest = {
-        "target": TARGET,
-        "dropped_for_leakage": dropped_for_leakage,
-        "leakage_reasoning": {
-            "fev1_fvc_ratio": "fev1 = fev1_fvc_ratio * fvc almost exactly -> direct leakage.",
-            "fev1_phase2": "looks like a repeat FEV1 measurement for the same participant -> near-duplicate of the target.",
+        "target_candidates": TARGET_CANDIDATES,
+        "reference_columns_not_features": {
+            "sid": "subject identifier -- kept in the CSV for traceability, never a feature for any target.",
         },
         "flagged_not_dropped": {
-            "fvc": (
-                "kept as a feature (physiologically legitimate input), but combined "
-                "with fev1_fvc_ratio it reconstructs fev1 exactly -- only use one of "
-                "the two alongside fvc."
-            ),
             "respiratory_is_copd": (
-                "a COPD diagnosis flag is clinically correlated with FEV1 by definition "
-                "(diagnostic criteria use an FEV1/FVC threshold) -- not exact leakage like "
-                "the ratio, but review with the team before using it as a feature."
+                "a COPD diagnosis flag is clinically correlated with FEV1/GOLD "
+                "status by definition -- not exact leakage, but review with the "
+                "team before using it as a feature for the gold_copd target."
             ),
         },
         "engineered_columns": [
@@ -89,19 +145,34 @@ def engineer_features(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
             "pack_years",
             "air_trapping_ratio",
             "respiratory_reported",
+            "gold_copd",
         ]
         + engineered_respiratory_cols,
         "categorical_columns_cast": CATEGORICAL_COLUMNS,
         "respiratory_conditions_found": all_conditions,
+        "gold_threshold": GOLD_THRESHOLD,
     }
 
     return out, manifest
 
 
-def build_model_ready(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
-    engineered, manifest = engineer_features(df)
-    model_ready = engineered.drop(columns=manifest["dropped_for_leakage"], errors="ignore")
-    return model_ready, manifest
+def build_dataset_for_target(df: pd.DataFrame, target_name: str) -> tuple[pd.DataFrame, dict]:
+    """Return a feature set that's leakage-correct for `target_name`.
+
+    The target column itself stays in the output (as `y` for whoever trains
+    on it); only the OTHER columns that would leak it are dropped.
+    """
+    spec = TARGET_CANDIDATES[target_name]
+    drop_cols = [c for c in spec["excluded_features"] if c in df.columns]
+    dataset = df.drop(columns=drop_cols, errors="ignore")
+    info = {
+        "target": target_name,
+        "kind": spec["kind"],
+        "description": spec["description"],
+        "dropped_columns": drop_cols,
+        "exclusion_reasoning": spec["exclusion_reasoning"],
+    }
+    return dataset, info
 
 
 def write_manifest(manifest: dict, path=None) -> None:
