@@ -130,14 +130,16 @@ DEFAULT_BASE_MODELS = {
         random_seed=RANDOM_STATE,
         allow_writing_files=False,
     ),
+    # NOTE: objective/eval_metric are intentionally NOT hardcoded. XGBClassifier
+    # auto-infers binary:logistic for 2 classes and multi:softprob for >2 classes,
+    # and sets num_class automatically. Hardcoding multi:softprob makes XGBoost
+    # require an explicit num_class even for the binary diagnosis target.
     "xgboost": XGBClassifier(
         n_estimators=300,
         learning_rate=0.05,
         max_depth=5,
         subsample=0.8,
         colsample_bytree=0.8,
-        objective="multi:softprob",
-        eval_metric="mlogloss",
         random_state=RANDOM_STATE,
         n_jobs=2,
     ),
@@ -182,11 +184,16 @@ def _classification_metrics(
     }
     if y_proba is not None and len(np.unique(y_true)) >= 2:
         try:
-            metrics["roc_auc_ovr"] = float(
-                roc_auc_score(y_true, y_proba, multi_class="ovr", average="macro")
-            )
+            auc = float(roc_auc_score(y_true, y_proba, multi_class="ovr", average="macro"))
+            # Only log a finite AUC. Logging NaN (is_nan=1, value=0.0) for several
+            # base models at the same timestamp trips MLflow's SQLite unique
+            # constraint on (key, timestamp, step, run_uuid, value, is_nan).
+            if np.isfinite(auc):
+                metrics["roc_auc_ovr"] = auc
         except ValueError:
-            metrics["roc_auc_ovr"] = float("nan")
+            # roc_auc cannot be computed (e.g. a class is absent from y_true or
+            # from the model's predicted columns); omit it rather than logging NaN.
+            pass
     return metrics
 
 
