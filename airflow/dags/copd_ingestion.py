@@ -6,10 +6,14 @@ published and lands them, unmodified, into a date-partitioned raw zone. It does
 NOT parse, clean, validate schemas, or join the sources — that is downstream work
 owned by other team members.
 
-Sources (all keyed by `sid`):
-  - demographics : CSV
-  - imaging      : JSON
-  - spirometry   : HTML (contains an HTML <table>)
+Core sources (all keyed by `sid`, merged downstream):
+  - demographics : CSV  (static file download)
+  - imaging      : JSON (static file download)
+  - spirometry   : HTML (static file download; contains an HTML <table>)
+
+Context sources (population-level, NOT keyed by `sid`, landed raw only):
+  - cdc_copd_prevalence : JSON (live CDC Socrata SODA API)
+  - smoking_prevalence  : HTML (web scrape of a Wikipedia article)
 
 Landing layout (one partition per DAG run date):
   data/raw/<source>/<YYYY-MM-DD>/<source>.<ext>
@@ -42,6 +46,9 @@ RAW_ROOT = os.environ.get("COPD_RAW_ROOT", os.path.join(AIRFLOW_HOME, "data", "r
 # HTTP settings
 REQUEST_TIMEOUT = 60          # seconds
 REQUEST_MAX_RETRIES = 3       # handled by Airflow task retries too; this is per-call
+# Some sites (e.g. Wikipedia) reject the default python-requests User-Agent with
+# HTTP 403, so we send a descriptive one. Being a good scraping citizen too.
+USER_AGENT = "COPDGene-ingestion/0.1 (student project; contact: team)"
 
 # Preprocessing artifacts are stored separately from raw landing data.
 ARTIFACT_ROOT = os.environ.get("COPD_ARTIFACT_ROOT", os.path.join(AIRFLOW_HOME, "data", "artifacts"))
@@ -66,13 +73,46 @@ SOURCES = {
     },
 }
 
+# Additional "context" sources added to satisfy the project's multi-source,
+# multi-method ingestion requirement (live API + web scrape, from other websites).
+#
+# IMPORTANT: these are POPULATION-LEVEL (national / state / country) and are NOT
+# keyed by `sid`. They are landed raw here for provenance, but are deliberately
+# NOT merged into the sid-level dataset by the preprocessing step — there is no
+# join key. Downstream may use them for coarse context features only.
+#
+#   - cdc_copd_prevalence : live REST API pull (CDC Socrata SODA), JSON
+#   - smoking_prevalence  : web scrape of an HTML page (tables parsed downstream)
+CONTEXT_SOURCES = {
+    "cdc_copd_prevalence": {
+        # CDC U.S. Chronic Disease Indicators, filtered to COPD (topicid=COPD).
+        # SODA API returns JSON; $limit is set high enough to return all COPD rows.
+        "url": "https://data.cdc.gov/resource/hksd-2xuw.json?topicid=COPD&$limit=50000",
+        "ext": "json",
+        "kind": "api",
+    },
+    "smoking_prevalence": {
+        # Wikipedia article containing tobacco-use prevalence tables.
+        "url": "https://en.wikipedia.org/wiki/Prevalence_of_tobacco_use",
+        "ext": "html",
+        "kind": "web_scrape",
+    },
+}
+
 
 # ---------------------------------------------------------------------------
 # Ingestion logic
 # ---------------------------------------------------------------------------
 
 @task
-def ingest_source(source_name: str, url: str, ext: str, ds: str = None, run_id: str = None) -> str:
+def ingest_source(
+    source_name: str,
+    url: str,
+    ext: str,
+    source_kind: str = "download",
+    ds: str = None,
+    run_id: str = None,
+) -> str:
     """Download one raw source and land it, byte-for-byte, in the raw zone.
 
     Returns the path of the landed file (also pushed to XCom automatically).
@@ -89,6 +129,7 @@ def ingest_source(source_name: str, url: str, ext: str, ds: str = None, run_id: 
 
     # Download the raw bytes.
     session = requests.Session()
+    session.headers.update({"User-Agent": USER_AGENT})
     last_err = None
     for attempt in range(1, REQUEST_MAX_RETRIES + 1):
         try:
@@ -113,6 +154,7 @@ def ingest_source(source_name: str, url: str, ext: str, ds: str = None, run_id: 
     metadata = {
         "source_name": source_name,
         "source_url": url,
+        "ingestion_kind": source_kind,
         "http_status": resp.status_code,
         "content_type": resp.headers.get("Content-Type"),
         "content_length_reported": resp.headers.get("Content-Length"),
@@ -162,7 +204,21 @@ def copd_ingestion():
 
     @task
     def preprocessing(demographics_path: str, imaging_path: str, spirometry_path: str) -> str:
-        """Impute missing values and fit reusable preprocessing artifacts."""
+        """Merge and transform the three core sid-keyed sources only.
+
+        Context sources (cdc_copd_prevalence, smoking_prevalence) are deliberately
+        excluded because they are population-level and have no `sid` join key. The
+        output is a clean, model-ready matrix plus reusable sklearn artifacts.
+
+        Steps:
+        1. Load the three core sources and validate their schemas.
+        2. Outer-merge on `sid`.
+        3. Drop leakage / non-feature columns (`sid`, `visit_date`, `respiratory`).
+        4. One-hot encode categoricals (`gender`, `race`, `smoking_status`) and
+           median-impute + standard-scale numeric columns.
+        5. Persist the central preprocessed dataset, the fitted preprocessor, and
+           a JSON preprocessing manifest.
+        """
         from airflow.sdk import get_current_context
         import joblib
         import pandas as pd
@@ -176,34 +232,111 @@ def copd_ingestion():
         preprocessed_dir = os.path.join(PREPROCESSED_ROOT, ds)
         os.makedirs(preprocessed_dir, exist_ok=True)
 
+        # Expected schemas for the three core sid-keyed sources. These are the only
+        # columns allowed in the final merged dataset; anything else is treated as
+        # schema drift and rejected. This guards against context-source columns or
+        # future upstream changes leaking into the sid-level model matrix.
+        EXPECTED_COLUMNS = {
+            "demographics": {
+                "sid",
+                "visit_year",
+                "visit_date",
+                "visit_age",
+                "gender",
+                "race",
+                "smoking_status",
+                "height_cm",
+                "weight_kg",
+                "blood_pressure_systolic",
+                "blood_pressure_diastolic",
+                "heart_rate",
+                "hours_on_oxygen",
+                "bmi",
+                "smoke_start_age",
+                "cigs_per_day_avg",
+                "duration_smoking",
+                "respiratory",
+            },
+            "imaging": {
+                "sid",
+                "lung_volume_inspiratory",
+                "emphysema_percentage",
+                "lung_volume_expiratory",
+                "gas_trapping_percentage",
+                "mean_density_inspiratory",
+                "mean_density_expiratory",
+            },
+            "spirometry": {
+                "sid",
+                "fev1_fvc_ratio",
+                "fev1",
+                "fvc",
+                "fev1_phase2",
+            },
+        }
+
+        def _validate_source(name: str, df: pd.DataFrame) -> None:
+            expected = EXPECTED_COLUMNS[name]
+            actual = set(df.columns)
+            missing = expected - actual
+            extra = actual - expected
+            if missing:
+                raise ValueError(
+                    f"{name} is missing required columns: {sorted(missing)}"
+                )
+            if extra:
+                raise ValueError(
+                    f"{name} has unexpected columns that are not present in the "
+                    f"expected schema for the other core sources: {sorted(extra)}"
+                )
+
         demographics = pd.read_csv(demographics_path)
         imaging = pd.read_json(imaging_path)
         spirometry = pd.read_html(spirometry_path)[0]
 
-        merged = demographics.merge(imaging, on="sid", how="outer", suffixes=("_demographics", "_imaging"))
-        merged = merged.merge(spirometry, on="sid", how="outer", suffixes=("", "_spirometry"))
+        _validate_source("demographics", demographics)
+        _validate_source("imaging", imaging)
+        _validate_source("spirometry", spirometry)
+
+        merged = demographics.merge(
+            imaging, on="sid", how="outer", suffixes=("_demographics", "_imaging")
+        )
+        merged = merged.merge(
+            spirometry, on="sid", how="outer", suffixes=("", "_spirometry")
+        )
 
         if "sid" not in merged.columns:
             raise ValueError("merged dataset does not contain required sid column")
 
-        lower_columns = {col.lower(): col for col in merged.columns}
+        # Columns that are not model features. `sid` is a leakage key; `visit_date`
+        # is a non-numeric string; `respiratory` is a pipe-delimited free-text field
+        # that would need a dedicated text-encoding step. None of these are present
+        # in imaging or spirometry, so they are explicitly excluded from the model
+        # matrix to keep the dataset aligned with the columns that all three sources
+        # can contribute.
+        DROP_REASONS = {
+            "sid": "subject identifier / leakage key",
+            "visit_date": "non-informative string column, not present in other sources",
+            "respiratory": "pipe-delimited free-text, not present in other sources",
+        }
+        dropped_feature_cols = [col for col in DROP_REASONS if col in merged.columns]
+        feature_df = merged.drop(columns=dropped_feature_cols, errors="ignore")
+
+        lower_columns = {col.lower(): col for col in feature_df.columns}
         categorical_cols = [
             lower_columns[name]
             for name in ("gender", "race", "smoking_status")
             if name in lower_columns
         ]
-        leakage_cols = [col for col in ("sid",) if col in merged.columns]
         numeric_cols = [
             col
-            for col in merged.columns
-            if col not in categorical_cols + leakage_cols
-            and pd.api.types.is_numeric_dtype(merged[col])
+            for col in feature_df.columns
+            if col not in categorical_cols
+            and pd.api.types.is_numeric_dtype(feature_df[col])
         ]
 
         if not categorical_cols and not numeric_cols:
             raise ValueError("no usable feature columns found after applying the ColumnTransformer rules")
-
-        feature_df = merged.drop(columns=leakage_cols, errors="ignore")
 
         preprocessor = ColumnTransformer(
             transformers=[
@@ -239,39 +372,89 @@ def copd_ingestion():
         preprocessed_columns = preprocessor.get_feature_names_out()
         preprocessed_df = pd.DataFrame(preprocessed_array, columns=preprocessed_columns, index=feature_df.index)
 
+        artifact_path = os.path.join(preprocessed_dir, "preprocessing_artifacts.joblib")
+        summary_path = os.path.join(preprocessed_dir, "preprocessing_artifacts.json")
+        manifest_path = os.path.join(preprocessed_dir, "preprocessing_manifest.json")
+        central_dataset_path = os.path.join(preprocessed_dir, "central_preprocessed_dataset.csv")
+
         artifacts = {
             "preprocessor": preprocessor,
             "numeric_columns": numeric_cols,
             "categorical_columns": categorical_cols,
-            "dropped_leakage_columns": leakage_cols,
+            "dropped_columns": {
+                "leakage": ["sid"],
+                "non_feature": ["visit_date", "respiratory"],
+                "all": dropped_feature_cols,
+                "reasons": DROP_REASONS,
+            },
             "source_paths": {
                 "demographics": demographics_path,
                 "imaging": imaging_path,
                 "spirometry": spirometry_path,
             },
             "partition_ds": ds,
+            "central_dataset_path": central_dataset_path,
+            "manifest_path": manifest_path,
+            "summary_path": summary_path,
         }
-
-        artifact_path = os.path.join(preprocessed_dir, "preprocessing_artifacts.joblib")
         joblib.dump(artifacts, artifact_path)
 
-        summary_path = os.path.join(preprocessed_dir, "preprocessing_artifacts.json")
         with open(summary_path, "w", encoding="utf-8") as fh:
             json.dump(
                 {
                     "artifact_path": artifact_path,
                     "numeric_columns": numeric_cols,
                     "categorical_columns": categorical_cols,
-                    "dropped_leakage_columns": leakage_cols,
+                    "dropped_columns": artifacts["dropped_columns"],
                     "partition_ds": ds,
                 },
                 fh,
                 indent=2,
             )
 
-        central_dataset_path = os.path.join(preprocessed_dir, "central_preprocessed_dataset.csv")
+        with open(manifest_path, "w", encoding="utf-8") as fh:
+            json.dump(
+                {
+                    "partition_ds": ds,
+                    "source_paths": artifacts["source_paths"],
+                    "expected_columns": {k: sorted(v) for k, v in EXPECTED_COLUMNS.items()},
+                    "actual_columns": {
+                        "demographics": sorted(demographics.columns.tolist()),
+                        "imaging": sorted(imaging.columns.tolist()),
+                        "spirometry": sorted(spirometry.columns.tolist()),
+                    },
+                    "context_sources_excluded": [
+                        "cdc_copd_prevalence",
+                        "smoking_prevalence",
+                    ],
+                    "context_sources_exclusion_reason": (
+                        "population-level sources with no sid join key; "
+                        "they are landed raw but not merged into the sid-level dataset"
+                    ),
+                    "merged_shape": merged.shape,
+                    "dropped_columns": artifacts["dropped_columns"],
+                    "feature_columns": {
+                        "categorical": categorical_cols,
+                        "numeric": numeric_cols,
+                    },
+                    "preprocessed_shape": preprocessed_df.shape,
+                    "preprocessed_columns": preprocessed_columns.tolist(),
+                    "output_files": {
+                        "central_dataset": central_dataset_path,
+                        "artifacts": artifact_path,
+                        "summary": summary_path,
+                    },
+                },
+                fh,
+                indent=2,
+            )
+
         preprocessed_df.to_csv(central_dataset_path, index=False)
 
+        print(
+            f"[preprocess] merged={merged.shape} -> features={feature_df.shape} "
+            f"-> preprocessed={preprocessed_df.shape} -> {central_dataset_path}"
+        )
         return artifact_path
 
     @task
@@ -284,21 +467,42 @@ def copd_ingestion():
         source_name="demographics",
         url=SOURCES["demographics"]["url"],
         ext=SOURCES["demographics"]["ext"],
+        source_kind="static_file",
     )
     imaging_task = ingest_source(
         source_name="imaging",
         url=SOURCES["imaging"]["url"],
         ext=SOURCES["imaging"]["ext"],
+        source_kind="static_file",
     )
     spirometry_task = ingest_source(
         source_name="spirometry",
         url=SOURCES["spirometry"]["url"],
         ext=SOURCES["spirometry"]["ext"],
+        source_kind="static_file",
     )
+
+    # Context sources: landed raw only, one task each (explicit task_id per source).
+    # They are NOT passed into preprocessing because they have no `sid` join key.
+    context_tasks = [
+        ingest_source.override(task_id=f"ingest_{name}")(
+            source_name=name,
+            url=cfg["url"],
+            ext=cfg["ext"],
+            source_kind=cfg["kind"],
+        )
+        for name, cfg in CONTEXT_SOURCES.items()
+    ]
+
     preprocessing_task = preprocessing(demographics_task, imaging_task, spirometry_task)
     complete_task = ingestion_complete(preprocessing_task)
 
+    # Core path: 3 sid-keyed sources -> merge/preprocess -> complete.
     start_task >> [demographics_task, imaging_task, spirometry_task] >> preprocessing_task >> complete_task
+    # Context path: parallel raw landings that also gate completion (no merge).
+    start_task >> context_tasks
+    for context_task in context_tasks:
+        context_task >> complete_task
 
 
 copd_dag = copd_ingestion()

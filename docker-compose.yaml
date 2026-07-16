@@ -9,7 +9,7 @@
 # The DAG lands raw files into ./data/raw on your host (mounted into the containers).
 
 x-airflow-common: &airflow-common
-  image: apache/airflow:2.9.3
+  image: apache/airflow:3.3.0
   environment: &airflow-common-env
     AIRFLOW__CORE__EXECUTOR: LocalExecutor
     AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow

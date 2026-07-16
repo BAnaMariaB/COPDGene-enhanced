@@ -1,21 +1,36 @@
 # COPD Ingestion Pipeline (Airflow)
 
-Ingestion-only Airflow pipeline for the COPD project. It pulls three raw source
-files and lands them, **byte-for-byte unchanged**, into a date-partitioned raw
-zone. No parsing, cleaning, schema validation, or joining happens here — that is
-downstream work owned by other team members.
+Ingestion-only Airflow pipeline for the COPD project. It pulls raw source data
+from several websites, using several methods (static download, live REST API, and
+web scrape), and lands each payload **byte-for-byte unchanged** into a
+date-partitioned raw zone. No parsing, cleaning, schema validation, or joining
+happens here — that is downstream work owned by other team members.
 
 ## Scope
 
-| Source | Format | URL |
-|---|---|---|
-| demographics | CSV | `.../copd_data_demographics.csv` |
-| imaging | JSON | `.../copd_data_imaging.json` |
-| spirometry | HTML | `.../copd_data_spirometry.html` |
+**Core sources** — keyed by `sid`, merged downstream:
 
-All three share a `sid` key, but this pipeline does **not** touch the contents —
-it only downloads and lands them. One DAG, `copd_ingestion`, runs the three
-downloads in parallel.
+| Source | Format | Method | URL |
+|---|---|---|---|
+| demographics | CSV | static file | `.../copd_data_demographics.csv` |
+| imaging | JSON | static file | `.../copd_data_imaging.json` |
+| spirometry | HTML | static file | `.../copd_data_spirometry.html` |
+
+**Context sources** — population-level, **not** keyed by `sid`, landed raw only
+(added to meet the "multiple websites / API / scraping" requirement):
+
+| Source | Format | Method | URL |
+|---|---|---|---|
+| cdc_copd_prevalence | JSON | live API (CDC Socrata SODA) | `data.cdc.gov/resource/hksd-2xuw.json?topicid=COPD` |
+| smoking_prevalence | HTML | web scrape (Wikipedia) | `en.wikipedia.org/wiki/Prevalence_of_tobacco_use` |
+
+The three core sources share a `sid` key and are merged by the preprocessing step.
+The two context sources have **no `sid` join key**, so they are landed raw for
+provenance and gate completion, but are deliberately **not** merged into the
+sid-level dataset. This pipeline does not touch any payload's contents — it only
+downloads and lands them. One DAG, `copd_ingestion`, runs all downloads in
+parallel. See [`docs/data_overview.md`](docs/data_overview.md) for how each
+source is best worked into the modeling data.
 
 ## Landing layout
 
@@ -23,18 +38,17 @@ Each run writes to a partition named after the run's logical date:
 
 ```
 data/raw/
-├── demographics/<YYYY-MM-DD>/demographics.csv
-│                              demographics.csv.meta.json
-├── imaging/<YYYY-MM-DD>/imaging.json
-│                        imaging.json.meta.json
-└── spirometry/<YYYY-MM-DD>/spirometry.html
-                            spirometry.html.meta.json
+├── demographics/<YYYY-MM-DD>/demographics.csv (+ .meta.json)
+├── imaging/<YYYY-MM-DD>/imaging.json (+ .meta.json)
+├── spirometry/<YYYY-MM-DD>/spirometry.html (+ .meta.json)
+├── cdc_copd_prevalence/<YYYY-MM-DD>/cdc_copd_prevalence.json (+ .meta.json)
+└── smoking_prevalence/<YYYY-MM-DD>/smoking_prevalence.html (+ .meta.json)
 ```
 
 The `.meta.json` sidecar next to each file records ingestion provenance only
-(source URL, HTTP status, byte count, SHA-256, timestamp, host, run id). It never
-modifies the payload. Downstream tasks can read the raw file and ignore or use
-the sidecar as they wish.
+(source URL, ingestion kind — `static_file` / `api` / `web_scrape` — HTTP status,
+byte count, SHA-256, timestamp, host, run id). It never modifies the payload.
+Downstream tasks can read the raw file and ignore or use the sidecar as they wish.
 
 ## Run it locally (Docker)
 
@@ -45,7 +59,7 @@ cd copd-ingestion
 
 # 1. (Linux/macOS) make Airflow write files as your user:
 echo "AIRFLOW_UID=$(id -u)" > .env
-echo "_PIP_ADDITIONAL_REQUIREMENTS=requests==2.32.3" >> .env
+echo "_PIP_ADDITIONAL_REQUIREMENTS=requests>=2.31,<3" >> .env
 
 # 2. start the stack (first boot runs db init + creates the admin user)
 docker compose up -d
@@ -115,3 +129,5 @@ export COPD_ARTIFACT_ROOT=/your/artifacts/zone
 Downstream (preparation/transformation) reads from `data/raw/<source>/<date>/`.
 The pipeline guarantees the file is present and unchanged from source; it makes
 no guarantees about the file's internal schema or quality — that is their layer.
+For the preprocessing step that merges the three core `sid`-keyed sources and
+produces the model-ready dataset, see [`DATA_PREPROCESSING.md`](DATA_PREPROCESSING.md).
