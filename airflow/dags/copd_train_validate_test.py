@@ -78,8 +78,9 @@ from sklearn.metrics import (
     recall_score,
     roc_auc_score,
 )
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import StratifiedKFold, train_test_split
 from sklearn.preprocessing import LabelEncoder
+from sklearn.utils.class_weight import compute_sample_weight
 from xgboost import XGBClassifier
 
 # ---------------------------------------------------------------------------
@@ -113,10 +114,60 @@ TEST_SIZE = float(os.environ.get("COPD_TEST_SIZE", "0.15"))
 VAL_SIZE = float(os.environ.get("COPD_VAL_SIZE", "0.15"))
 RANDOM_STATE = int(os.environ.get("COPD_RANDOM_STATE", "42"))
 
+# Stacking setting: train the meta-model on out-of-fold (OOF) base predictions.
+# Set COPD_OOF_FOLDS>1 to enable.
+OOF_FOLDS = int(os.environ.get("COPD_OOF_FOLDS", "1"))
+
+# Sample-weight controls.
+# - Diagnosis is extremely imbalanced (no COPD is the majority). Using fully-balanced
+#   weights can cause over-prediction of COPD, which severely hurts overall GOLD metrics.
+DIAGNOSIS_USE_SAMPLE_WEIGHTS = os.environ.get("COPD_DIAGNOSIS_USE_SAMPLE_WEIGHTS", "0") == "1"
+GOLD_USE_SAMPLE_WEIGHTS = os.environ.get("COPD_GOLD_USE_SAMPLE_WEIGHTS", "1") == "1"
+
+# Optional tuning of the diagnosis probability threshold to improve downstream GOLD-stage
+# metrics (since GOLD_0 vs GOLD_1..4 depends heavily on diagnosis gating).
+TUNE_DIAGNOSIS_THRESHOLD = os.environ.get("COPD_TUNE_DIAGNOSIS_THRESHOLD", "1") == "1"
+DIAGNOSIS_THRESHOLD_GRID = [
+    float(x)
+    for x in os.environ.get(
+        "COPD_DIAGNOSIS_THRESHOLD_GRID",
+        "0.10,0.15,0.20,0.25,0.30,0.35,0.40,0.45,0.50,0.55,0.60,0.65,0.70,0.75,0.80,0.85,0.90",
+    ).split(",")
+    if x.strip()
+]
+TUNE_DIAGNOSIS_THRESHOLD_FOR = os.environ.get(
+    "COPD_TUNE_DIAGNOSIS_THRESHOLD_FOR", "gold_stage_f1_macro"
+)
+
 # Human-readable class labels for each target. The LabelEncoder determines the
 # integer encoding from the observed values in the partition.
 DIAGNOSIS_CLASS_LABELS = ["no_copd", "copd"]
 GOLD_CLASS_LABELS = ["GOLD_0", "GOLD_1", "GOLD_2", "GOLD_3", "GOLD_4"]
+
+# Leakage guard: these columns are used to DEFINE the targets. If kept as
+# features, the task becomes close to deterministic and yields misleadingly high
+# scores.
+#
+# We ALWAYS drop target-definition columns (ratio and % predicted).
+#
+# For diagnosis, raw spirometry measurements are also dropped by default to avoid
+# a trivial reconstruction of the COPD criterion from FEV1/FVC.
+# GOLD staging is allowed to use raw spirometry (it is clinically defined from
+# spirometry), but still must not use the already-derived %pred/ratio columns.
+TARGET_DEFINITION_COLUMNS = [
+    "fev1_fvc_ratio",
+    "fev1_pct_predicted",
+]
+RAW_SPIROMETRY_COLUMNS = [
+    "fev1_ml",
+    "fvc_ml",
+]
+DIAGNOSIS_DROP_RAW_SPIROMETRY = os.environ.get(
+    "COPD_DIAGNOSIS_DROP_RAW_SPIROMETRY", "1"
+) == "1"
+GOLD_DROP_RAW_SPIROMETRY = os.environ.get(
+    "COPD_GOLD_DROP_RAW_SPIROMETRY", "0"
+) == "1"
 
 # Default base classifiers for the single ensemble system. They are all trained on
 # the same data and are always used together during inference.
@@ -173,26 +224,42 @@ def _partition_paths(ds: str) -> dict[str, str]:
 
 
 def _classification_metrics(
-    y_true: np.ndarray, y_pred: np.ndarray, y_proba: np.ndarray | None = None
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    y_proba: np.ndarray | None = None,
+    labels: list[int] | None = None,
 ) -> dict[str, float]:
-    """Compute classification metrics used for model evaluation."""
+    """Compute classification metrics used for model evaluation.
+
+    `labels` can be provided to ensure macro metrics are computed over a fixed
+    label set (e.g. GOLD_0..GOLD_4), even if some classes are missing from a
+    particular split.
+    """
     metrics = {
         "accuracy": float(accuracy_score(y_true, y_pred)),
-        "precision_macro": float(precision_score(y_true, y_pred, average="macro", zero_division=0)),
-        "recall_macro": float(recall_score(y_true, y_pred, average="macro", zero_division=0)),
-        "f1_macro": float(f1_score(y_true, y_pred, average="macro", zero_division=0)),
+        "precision_macro": float(
+            precision_score(y_true, y_pred, labels=labels, average="macro", zero_division=0)
+        ),
+        "recall_macro": float(
+            recall_score(y_true, y_pred, labels=labels, average="macro", zero_division=0)
+        ),
+        "f1_macro": float(f1_score(y_true, y_pred, labels=labels, average="macro", zero_division=0)),
+        "precision_weighted": float(
+            precision_score(y_true, y_pred, labels=labels, average="weighted", zero_division=0)
+        ),
+        "recall_weighted": float(
+            recall_score(y_true, y_pred, labels=labels, average="weighted", zero_division=0)
+        ),
+        "f1_weighted": float(
+            f1_score(y_true, y_pred, labels=labels, average="weighted", zero_division=0)
+        ),
     }
     if y_proba is not None and len(np.unique(y_true)) >= 2:
         try:
             auc = float(roc_auc_score(y_true, y_proba, multi_class="ovr", average="macro"))
-            # Only log a finite AUC. Logging NaN (is_nan=1, value=0.0) for several
-            # base models at the same timestamp trips MLflow's SQLite unique
-            # constraint on (key, timestamp, step, run_uuid, value, is_nan).
             if np.isfinite(auc):
                 metrics["roc_auc_ovr"] = auc
         except ValueError:
-            # roc_auc cannot be computed (e.g. a class is absent from y_true or
-            # from the model's predicted columns); omit it rather than logging NaN.
             pass
     return metrics
 
@@ -219,7 +286,10 @@ def _build_targets(
     y_diagnosis_labels = df[DIAGNOSIS_TARGET_COLUMN].apply(lambda v: DIAGNOSIS_CLASS_LABELS[int(v)] if int(v) < len(DIAGNOSIS_CLASS_LABELS) else str(v))
     y_gold_labels = df[GOLD_TARGET_COLUMN].apply(lambda v: GOLD_CLASS_LABELS[int(v)] if int(v) < len(GOLD_CLASS_LABELS) else str(v))
 
-    X = df.drop(columns=[DIAGNOSIS_TARGET_COLUMN, GOLD_TARGET_COLUMN], errors="ignore")
+    X = df.drop(
+        columns=[DIAGNOSIS_TARGET_COLUMN, GOLD_TARGET_COLUMN, *TARGET_DEFINITION_COLUMNS],
+        errors="ignore",
+    )
 
     diagnosis_encoder = LabelEncoder()
     diagnosis_encoder.fit(y_diagnosis_labels)
@@ -259,10 +329,12 @@ class COPDEnsembleClassifier:
         base_models: dict[str, Any] | None = None,
         meta_model: Any | None = None,
         random_state: int = RANDOM_STATE,
+        use_sample_weights: bool = True,
     ) -> None:
         self.base_model_configs = base_models or DEFAULT_BASE_MODELS
         self.meta_model_config = meta_model or DEFAULT_META_MODEL
         self.random_state = random_state
+        self.use_sample_weights = use_sample_weights
 
         self.fitted_base_models: dict[str, Any] = {}
         self.fitted_meta_model: Any | None = None
@@ -280,20 +352,86 @@ class COPDEnsembleClassifier:
         # Store the feature column order for inference reproducibility.
         self.feature_columns = list(X_train.columns)
 
-        # Train every base classifier on the same training set.
+        sw_train = None
+        sw_val = None
+        if self.use_sample_weights:
+            # Use balanced sample weights to reduce the impact of strong class imbalance.
+            sw_train = compute_sample_weight(class_weight="balanced", y=y_train)
+            sw_val = compute_sample_weight(class_weight="balanced", y=y_val)
+
+        # Default: meta-model is trained on base probabilities on a held-out validation set.
+        # If OOF_FOLDS>1, train the meta-model on out-of-fold predictions computed on the
+        # training set (stacking), and keep the external validation split for evaluation.
+        use_oof = OOF_FOLDS > 1
+
+        if use_oof:
+            y_train_arr = np.asarray(y_train)
+            classes, counts = np.unique(y_train_arr, return_counts=True)
+            min_class = int(counts.min()) if len(counts) else 0
+            n_splits = max(1, min(OOF_FOLDS, min_class))
+            if n_splits < 2:
+                use_oof = False
+            else:
+                self.oof_n_splits = n_splits
+                skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=self.random_state)
+
+        oof_blocks: list[np.ndarray] = []
+
+        # Fit base models (and optionally compute OOF probabilities).
         for name, model in self.base_model_configs.items():
+            if use_oof:
+                # Determine the number of classes for a consistent proba matrix.
+                n_classes = int(len(np.unique(y_train_arr)))
+                oof_proba = np.zeros((X_train.shape[0], n_classes), dtype=float)
+                for tr_idx, hold_idx in skf.split(X_train, y_train_arr):
+                    fold_model = clone(model) if hasattr(model, "get_params") else model
+                    X_tr = X_train.iloc[tr_idx]
+                    y_tr = y_train_arr[tr_idx]
+                    if sw_train is not None:
+                        try:
+                            fold_model.fit(X_tr, y_tr, sample_weight=sw_train[tr_idx])
+                        except TypeError:
+                            fold_model.fit(X_tr, y_tr)
+                    else:
+                        fold_model.fit(X_tr, y_tr)
+                    oof_proba[hold_idx, :] = fold_model.predict_proba(X_train.iloc[hold_idx])
+                oof_blocks.append(oof_proba)
+
             fitted = clone(model) if hasattr(model, "get_params") else model
-            fitted.fit(X_train, y_train)
+            if sw_train is not None:
+                try:
+                    fitted.fit(X_train, y_train, sample_weight=sw_train)
+                except TypeError:
+                    fitted.fit(X_train, y_train)
+            else:
+                fitted.fit(X_train, y_train)
             self.fitted_base_models[name] = fitted
 
-        # Train the meta-learner on the base classifiers' validation probabilities.
-        meta_features = self._base_proba(X_val)
+        # Fit the meta-learner.
         self.fitted_meta_model = (
             clone(self.meta_model_config)
             if hasattr(self.meta_model_config, "get_params")
             else self.meta_model_config
         )
-        self.fitted_meta_model.fit(meta_features, y_val)
+
+        if use_oof:
+            meta_features = np.hstack(oof_blocks)
+            if sw_train is not None:
+                try:
+                    self.fitted_meta_model.fit(meta_features, y_train_arr, sample_weight=sw_train)
+                except TypeError:
+                    self.fitted_meta_model.fit(meta_features, y_train_arr)
+            else:
+                self.fitted_meta_model.fit(meta_features, y_train_arr)
+        else:
+            meta_features = self._base_proba(X_val)
+            if sw_val is not None:
+                try:
+                    self.fitted_meta_model.fit(meta_features, y_val, sample_weight=sw_val)
+                except TypeError:
+                    self.fitted_meta_model.fit(meta_features, y_val)
+            else:
+                self.fitted_meta_model.fit(meta_features, y_val)
 
         self.is_fitted = True
         return self
@@ -319,9 +457,13 @@ class COPDEnsembleClassifier:
         return self.fitted_meta_model.predict_proba(meta_features)
 
     def predict(self, X: pd.DataFrame) -> np.ndarray:
-        """Return predicted encoded class labels."""
-        proba = self.predict_proba(X)
-        return np.argmax(proba, axis=1)
+        """Return predicted class labels (as encoded integers)."""
+        if not self.is_fitted:
+            raise ValueError("Ensemble has not been fitted")
+        meta_features = self._base_proba(X)
+        # Use the meta-model's class predictions directly (do NOT argmax), because
+        # class labels are not guaranteed to be 0..K-1 in all training setups.
+        return self.fitted_meta_model.predict(meta_features)
 
     def predict_labels(self, X: pd.DataFrame) -> np.ndarray:
         """Return human-readable class labels using the stored LabelEncoder."""
@@ -331,20 +473,20 @@ class COPDEnsembleClassifier:
         return self.label_encoder.inverse_transform(encoded)
 
     def base_model_metrics(
-        self, X: pd.DataFrame, y: np.ndarray
+        self, X: pd.DataFrame, y: np.ndarray, labels: list[int] | None = None
     ) -> dict[str, dict[str, float]]:
         """Evaluate each fitted base classifier individually."""
         X = self._ensure_columns(X)
         return {
-            name: _classification_metrics(y, model.predict(X), model.predict_proba(X))
+            name: _classification_metrics(y, model.predict(X), model.predict_proba(X), labels=labels)
             for name, model in self.fitted_base_models.items()
         }
 
-    def metrics(self, X: pd.DataFrame, y: np.ndarray) -> dict[str, float]:
+    def metrics(self, X: pd.DataFrame, y: np.ndarray, labels: list[int] | None = None) -> dict[str, float]:
         """Evaluate the full ensemble on (X, y)."""
         y_pred = self.predict(X)
         y_proba = self.predict_proba(X)
-        return _classification_metrics(y, y_pred, y_proba)
+        return _classification_metrics(y, y_pred, y_proba, labels=labels)
 
     def save(self, path: str) -> None:
         """Persist the entire ensemble classifier system as one artifact."""
@@ -412,15 +554,21 @@ class COPDDoubleTargetSystem:
             base_models=diagnosis_base_models or DEFAULT_BASE_MODELS,
             meta_model=meta_model or DEFAULT_META_MODEL,
             random_state=random_state,
+            use_sample_weights=DIAGNOSIS_USE_SAMPLE_WEIGHTS,
         )
         self.gold_ensemble = COPDEnsembleClassifier(
             base_models=gold_base_models or DEFAULT_BASE_MODELS,
             meta_model=meta_model or DEFAULT_META_MODEL,
             random_state=random_state,
+            use_sample_weights=GOLD_USE_SAMPLE_WEIGHTS,
         )
+        self.diagnosis_threshold: float = 0.5
         self.diagnosis_label_encoder: LabelEncoder | None = None
         self.gold_label_encoder: LabelEncoder | None = None
         self.diagnosis_proba_column = "diagnosis_proba_copd"
+        # Index of the COPD class in diagnosis_ensemble.predict_proba output.
+        # Determined from diagnosis_label_encoder when available.
+        self.copd_class_index: int = 1
         self.is_fitted = False
 
     def fit(
@@ -433,41 +581,109 @@ class COPDDoubleTargetSystem:
         y_gold_val: np.ndarray,
     ) -> "COPDDoubleTargetSystem":
         """Train the diagnosis ensemble first, then the GOLD-stage ensemble."""
-        self.diagnosis_ensemble.fit(X_train, y_diagnosis_train, X_val, y_diagnosis_val)
+        X_train_diag = X_train.drop(columns=RAW_SPIROMETRY_COLUMNS, errors="ignore") if DIAGNOSIS_DROP_RAW_SPIROMETRY else X_train
+        X_val_diag = X_val.drop(columns=RAW_SPIROMETRY_COLUMNS, errors="ignore") if DIAGNOSIS_DROP_RAW_SPIROMETRY else X_val
+        self.diagnosis_ensemble.fit(X_train_diag, y_diagnosis_train, X_val_diag, y_diagnosis_val)
 
-        # Augment the GOLD-stage feature space with the predicted diagnosis probability.
+        # Determine which probability column corresponds to COPD.
+        self.copd_label_value = 1
+        self.no_copd_label_value = 0
+        if self.diagnosis_label_encoder is not None and hasattr(self.diagnosis_label_encoder, "classes_"):
+            classes = list(self.diagnosis_label_encoder.classes_)
+            if "copd" in classes:
+                self.copd_class_index = int(classes.index("copd"))
+                self.copd_label_value = int(self.diagnosis_label_encoder.transform(["copd"])[0])
+            if "no_copd" in classes:
+                self.no_copd_label_value = int(self.diagnosis_label_encoder.transform(["no_copd"])[0])
+
+        # Augment the GOLD-stage feature space with the predicted COPD probability.
         X_train_gold = X_train.copy()
         X_val_gold = X_val.copy()
-        X_train_gold[self.diagnosis_proba_column] = self.diagnosis_ensemble.predict_proba(X_train)[:, 1]
-        X_val_gold[self.diagnosis_proba_column] = self.diagnosis_ensemble.predict_proba(X_val)[:, 1]
+        if GOLD_DROP_RAW_SPIROMETRY:
+            X_train_gold = X_train_gold.drop(columns=RAW_SPIROMETRY_COLUMNS, errors="ignore")
+            X_val_gold = X_val_gold.drop(columns=RAW_SPIROMETRY_COLUMNS, errors="ignore")
+        X_train_gold[self.diagnosis_proba_column] = self._diagnosis_proba(X_train)
+        X_val_gold[self.diagnosis_proba_column] = self._diagnosis_proba(X_val)
 
-        self.gold_ensemble.fit(X_train_gold, y_gold_train, X_val_gold, y_gold_val)
+        # Train GOLD-stage model only on true COPD rows; GOLD_0 is a "no COPD" sentinel.
+        train_mask = (np.asarray(y_diagnosis_train) == self.copd_label_value) & (np.asarray(y_gold_train) > 0)
+        val_mask = (np.asarray(y_diagnosis_val) == self.copd_label_value) & (np.asarray(y_gold_val) > 0)
+
+        y_gold_train_sub = np.asarray(y_gold_train)[train_mask] - 1
+        y_gold_val_sub = np.asarray(y_gold_val)[val_mask] - 1
+
+        self.gold_ensemble.fit(
+            X_train_gold.loc[X_train_gold.index[train_mask]],
+            y_gold_train_sub,
+            X_val_gold.loc[X_val_gold.index[val_mask]],
+            y_gold_val_sub,
+        )
+
+        if TUNE_DIAGNOSIS_THRESHOLD:
+            self._tune_diagnosis_threshold(X_val, y_diagnosis_val, y_gold_val)
+
         self.is_fitted = True
         return self
 
     def _diagnosis_proba(self, X: pd.DataFrame) -> np.ndarray:
-        """Return the probability of COPD (positive class) from the diagnosis ensemble."""
-        return self.diagnosis_ensemble.predict_proba(X)[:, 1]
+        """Return the probability of COPD from the diagnosis ensemble."""
+        X_diag = X.drop(columns=RAW_SPIROMETRY_COLUMNS, errors="ignore") if DIAGNOSIS_DROP_RAW_SPIROMETRY else X
+        proba = self.diagnosis_ensemble.predict_proba(X_diag)
+        idx = self.copd_class_index
+        if idx < 0 or idx >= proba.shape[1]:
+            idx = 1 if proba.shape[1] > 1 else 0
+        return proba[:, idx]
+
+    def _predict_diagnosis_with_threshold(self, X: pd.DataFrame, threshold: float) -> np.ndarray:
+        proba = self._diagnosis_proba(X)
+        # In the LabelEncoder for diagnosis, COPD is identified by the string label "copd".
+        # We treat `proba` as P(COPD) and apply a tunable threshold.
+        return np.where(
+            proba >= threshold,
+            getattr(self, "copd_label_value", 1),
+            getattr(self, "no_copd_label_value", 0),
+        )
 
     def predict_diagnosis(self, X: pd.DataFrame) -> np.ndarray:
         """Return encoded diagnosis predictions."""
-        return self.diagnosis_ensemble.predict(X)
+        # For binary diagnosis, use probability-thresholding (tunable) rather than
+        # the meta-model's default decision threshold.
+        return self._predict_diagnosis_with_threshold(X, getattr(self, "diagnosis_threshold", 0.5))
 
     def predict_gold(self, X: pd.DataFrame) -> np.ndarray:
-        """Return encoded GOLD-stage predictions using diagnosis probability."""
-        X_gold = X.copy()
-        X_gold[self.diagnosis_proba_column] = self._diagnosis_proba(X)
-        return self.gold_ensemble.predict(X_gold)
+        """Return encoded GOLD-stage predictions (GOLD_0..GOLD_4)."""
+        gold_pred, _ = self._gold_pred_and_proba(X, getattr(self, "diagnosis_threshold", 0.5))
+        return gold_pred
 
     def predict_diagnosis_proba(self, X: pd.DataFrame) -> np.ndarray:
         """Return full diagnosis class probabilities."""
-        return self.diagnosis_ensemble.predict_proba(X)
+        X_diag = X.drop(columns=RAW_SPIROMETRY_COLUMNS, errors="ignore") if DIAGNOSIS_DROP_RAW_SPIROMETRY else X
+        return self.diagnosis_ensemble.predict_proba(X_diag)
+
+    def _gold_pred_and_proba(
+        self, X: pd.DataFrame, diagnosis_threshold: float
+    ) -> tuple[np.ndarray, np.ndarray]:
+        diag_pred = self._predict_diagnosis_with_threshold(X, diagnosis_threshold)
+        X_gold = X.copy()
+        if GOLD_DROP_RAW_SPIROMETRY:
+            X_gold = X_gold.drop(columns=RAW_SPIROMETRY_COLUMNS, errors="ignore")
+        X_gold[self.diagnosis_proba_column] = self._diagnosis_proba(X)
+
+        gold_pred = np.zeros(X.shape[0], dtype=int)
+        proba = np.zeros((X.shape[0], 5), dtype=float)
+        mask = np.asarray(diag_pred) == getattr(self, "copd_label_value", 1)
+        proba[~mask, 0] = 1.0
+        if np.any(mask):
+            sub_pred = self.gold_ensemble.predict(X_gold.loc[X_gold.index[mask]])
+            gold_pred[mask] = np.asarray(sub_pred, dtype=int) + 1
+            sub_proba = self.gold_ensemble.predict_proba(X_gold.loc[X_gold.index[mask]])
+            proba[mask, 1:5] = sub_proba
+        return gold_pred, proba
 
     def predict_gold_proba(self, X: pd.DataFrame) -> np.ndarray:
-        """Return full GOLD-stage class probabilities."""
-        X_gold = X.copy()
-        X_gold[self.diagnosis_proba_column] = self._diagnosis_proba(X)
-        return self.gold_ensemble.predict_proba(X_gold)
+        """Return full 5-class GOLD-stage probabilities (GOLD_0..GOLD_4)."""
+        _, proba = self._gold_pred_and_proba(X, getattr(self, "diagnosis_threshold", 0.5))
+        return proba
 
     def metrics(
         self, X: pd.DataFrame, y_diagnosis: np.ndarray, y_gold: np.ndarray
@@ -475,17 +691,90 @@ class COPDDoubleTargetSystem:
         """Evaluate both ensembles on (X, y_diagnosis, y_gold)."""
         y_diag_pred = self.predict_diagnosis(X)
         y_diag_proba = self.predict_diagnosis_proba(X)
-        y_gold_pred = self.predict_gold(X)
-        y_gold_proba = self.predict_gold_proba(X)
-        return {
-            "diagnosis": _classification_metrics(y_diagnosis, y_diag_pred, y_diag_proba),
-            "gold_stage": _classification_metrics(y_gold, y_gold_pred, y_gold_proba),
-            "diagnosis_base": self.diagnosis_ensemble.base_model_metrics(X, y_diagnosis),
-            "gold_stage_base": self.gold_ensemble.base_model_metrics(
-                pd.concat([X, pd.Series(self._diagnosis_proba(X), index=X.index, name=self.diagnosis_proba_column)], axis=1),
-                y_gold,
-            ),
+        y_gold_pred, y_gold_proba = self._gold_pred_and_proba(
+            X, getattr(self, "diagnosis_threshold", 0.5)
+        )
+        diag_labels = (
+            list(range(len(self.diagnosis_label_encoder.classes_)))
+            if self.diagnosis_label_encoder is not None and hasattr(self.diagnosis_label_encoder, "classes_")
+            else None
+        )
+        gold_labels = (
+            list(range(len(self.gold_label_encoder.classes_)))
+            if self.gold_label_encoder is not None and hasattr(self.gold_label_encoder, "classes_")
+            else list(range(5))
+        )
+
+        out = {
+            "diagnosis": _classification_metrics(y_diagnosis, y_diag_pred, y_diag_proba, labels=diag_labels),
+            "gold_stage": _classification_metrics(y_gold, y_gold_pred, y_gold_proba, labels=gold_labels),
+            "diagnosis_base": self.diagnosis_ensemble.base_model_metrics(X, y_diagnosis, labels=diag_labels),
+            "gold_stage_base": self._gold_base_metrics(X, y_diagnosis, y_gold),
         }
+        out["diagnosis_threshold"] = getattr(self, "diagnosis_threshold", 0.5)
+        return out
+
+    def _tune_diagnosis_threshold(
+        self, X_val: pd.DataFrame, y_diagnosis_val: np.ndarray, y_gold_val: np.ndarray
+    ) -> None:
+        """Tune diagnosis_threshold on validation to improve downstream metrics."""
+        best_t = getattr(self, "diagnosis_threshold", 0.5)
+        best_score = -1.0
+
+        for t in DIAGNOSIS_THRESHOLD_GRID:
+            # Diagnosis predictions under threshold.
+            y_diag_pred = self._predict_diagnosis_with_threshold(X_val, t)
+            y_diag_proba = self.predict_diagnosis_proba(X_val)
+            diag_labels = (
+                list(range(len(self.diagnosis_label_encoder.classes_)))
+                if self.diagnosis_label_encoder is not None and hasattr(self.diagnosis_label_encoder, "classes_")
+                else None
+            )
+            gold_labels = (
+                list(range(len(self.gold_label_encoder.classes_)))
+                if self.gold_label_encoder is not None and hasattr(self.gold_label_encoder, "classes_")
+                else list(range(5))
+            )
+
+            diag_metrics = _classification_metrics(
+                y_diagnosis_val, y_diag_pred, y_diag_proba, labels=diag_labels
+            )
+
+            # GOLD predictions/proba under threshold.
+            y_gold_pred, y_gold_proba = self._gold_pred_and_proba(X_val, t)
+            gold_metrics = _classification_metrics(y_gold_val, y_gold_pred, y_gold_proba, labels=gold_labels)
+
+            if TUNE_DIAGNOSIS_THRESHOLD_FOR == "diagnosis_f1_macro":
+                score = float(diag_metrics.get("f1_macro", 0.0))
+            elif TUNE_DIAGNOSIS_THRESHOLD_FOR == "gold_stage_accuracy":
+                score = float(gold_metrics.get("accuracy", 0.0))
+            elif TUNE_DIAGNOSIS_THRESHOLD_FOR == "gold_stage_f1_weighted":
+                score = float(gold_metrics.get("f1_weighted", 0.0))
+            else:
+                # Default: optimize overall GOLD-stage macro F1.
+                score = float(gold_metrics.get("f1_macro", 0.0))
+
+            if score > best_score:
+                best_score = score
+                best_t = t
+
+        self.diagnosis_threshold = float(best_t)
+
+    def _gold_base_metrics(
+        self, X: pd.DataFrame, y_diagnosis: np.ndarray, y_gold: np.ndarray
+    ) -> dict[str, dict[str, float]]:
+        """Evaluate GOLD base models on true COPD rows only (4-class, GOLD_1..GOLD_4)."""
+        X_gold = X.copy()
+        if GOLD_DROP_RAW_SPIROMETRY:
+            X_gold = X_gold.drop(columns=RAW_SPIROMETRY_COLUMNS, errors="ignore")
+        X_gold[self.diagnosis_proba_column] = self._diagnosis_proba(X)
+        mask = (np.asarray(y_diagnosis) == getattr(self, "copd_label_value", 1)) & (np.asarray(y_gold) > 0)
+        if not np.any(mask):
+            return {}
+        y_sub = np.asarray(y_gold)[mask] - 1
+        return self.gold_ensemble.base_model_metrics(
+            X_gold.loc[X_gold.index[mask]], y_sub, labels=list(range(4))
+        )
 
     def save(self, path: str) -> None:
         """Persist the entire double-target system."""
@@ -494,6 +783,7 @@ class COPDDoubleTargetSystem:
         self.gold_ensemble.save(os.path.join(path, "gold_ensemble"))
         bundle = {
             "diagnosis_proba_column": self.diagnosis_proba_column,
+            "diagnosis_threshold": getattr(self, "diagnosis_threshold", 0.5),
             "is_fitted": self.is_fitted,
             "random_state": self.diagnosis_ensemble.random_state,
         }
@@ -519,11 +809,20 @@ class COPDDoubleTargetSystem:
         with open(os.path.join(path, "system.json"), "r", encoding="utf-8") as fh:
             bundle = json.load(fh)
         instance.diagnosis_proba_column = bundle["diagnosis_proba_column"]
+        instance.diagnosis_threshold = float(bundle.get("diagnosis_threshold", 0.5))
         instance.is_fitted = bundle["is_fitted"]
         if "diagnosis_label_encoder" in bundle:
             le = LabelEncoder()
             le.classes_ = np.array(bundle["diagnosis_label_encoder"]["classes"])
             instance.diagnosis_label_encoder = le
+
+            # Recompute COPD class index + encoded label values after reload.
+            classes = list(le.classes_)
+            if "copd" in classes:
+                instance.copd_class_index = int(classes.index("copd"))
+                instance.copd_label_value = int(le.transform(["copd"])[0])
+            if "no_copd" in classes:
+                instance.no_copd_label_value = int(le.transform(["no_copd"])[0])
         if "gold_label_encoder" in bundle:
             le = LabelEncoder()
             le.classes_ = np.array(bundle["gold_label_encoder"]["classes"])
@@ -635,6 +934,10 @@ def copd_train_validate_test():
                     "n_features": X.shape[1],
                     "diagnosis_classes": DIAGNOSIS_CLASS_LABELS,
                     "gold_classes": GOLD_CLASS_LABELS,
+                    "oof_folds": OOF_FOLDS,
+                    "diagnosis_drop_raw_spirometry": DIAGNOSIS_DROP_RAW_SPIROMETRY,
+                    "gold_drop_raw_spirometry": GOLD_DROP_RAW_SPIROMETRY,
+                    "dropped_target_definition_columns": TARGET_DEFINITION_COLUMNS,
                 }
             )
             mlflow.log_metrics(
@@ -719,6 +1022,10 @@ def copd_train_validate_test():
                     "gold_n_classes": gold_n_classes,
                     "diagnosis_classes": data_info["diagnosis_classes"],
                     "gold_classes": data_info["gold_classes"],
+                    "diagnosis_use_sample_weights": DIAGNOSIS_USE_SAMPLE_WEIGHTS,
+                    "gold_use_sample_weights": GOLD_USE_SAMPLE_WEIGHTS,
+                    "tune_diagnosis_threshold": TUNE_DIAGNOSIS_THRESHOLD,
+                    "tune_diagnosis_threshold_for": TUNE_DIAGNOSIS_THRESHOLD_FOR,
                 }
             )
             mlflow.log_metrics({f"val_diagnosis_{k}": v for k, v in val_metrics["diagnosis"].items()})
@@ -899,10 +1206,12 @@ def copd_train_validate_test():
             mlflow.log_artifact(paths["champion_diagnosis_path"])
             mlflow.log_artifact(paths["champion_gold_path"])
 
+        dm = eval_info["comparison"]["test_metrics"]["diagnosis"]
+        gm = eval_info["comparison"]["test_metrics"]["gold_stage"]
         print(
             f"[champion] {champion_records['diagnosis']['model_name']} "
-            f"diagnosis_f1_macro={champion_records['diagnosis']['metric_value']:.4f} "
-            f"gold_stage_f1_macro={champion_records['gold_stage']['metric_value']:.4f} "
+            f"diagnosis(acc={dm.get('accuracy', 0.0):.3f},p={dm.get('precision_macro', 0.0):.3f},r={dm.get('recall_macro', 0.0):.3f},f1={dm.get('f1_macro', 0.0):.3f}) "
+            f"gold(acc={gm.get('accuracy', 0.0):.3f},p={gm.get('precision_macro', 0.0):.3f},r={gm.get('recall_macro', 0.0):.3f},f1={gm.get('f1_macro', 0.0):.3f}) "
             f"run_id={champion_records['diagnosis']['mlflow_run_id']}"
         )
         return {
