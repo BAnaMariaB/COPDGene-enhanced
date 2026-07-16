@@ -6,9 +6,11 @@ writes today). Keeping these separate until the team confirms whether this
 logic gets merged into that task, added as its own DAG step, or kept
 standalone. See README.md for the open questions.
 
-The team hasn't picked a final prediction target yet, so this produces a
-leakage-correct, target-ready CSV for each of the three live candidates
-(fev1, fev1_phase2, gold_copd) -- whichever one gets picked is already there.
+Team decision (2026-07-16): target is gold_copd (binary COPD classification
+via the GOLD criterion) -- regression on fev1_phase2 hit an RMSE ceiling and
+wasn't production-useful. This still emits target-ready CSVs for fev1 and
+fev1_phase2 as rejected/reference candidates (they're the evidence for the
+pivot), but centralized_dataset_target_gold_copd.csv is the one to model on.
 """
 
 from __future__ import annotations
@@ -65,12 +67,13 @@ def main() -> None:
 
     fe.write_manifest(target_manifest, path=OUTPUT_DIR / "target_candidates_manifest.json")
 
+    recommended_path = OUTPUT_DIR / f"centralized_dataset_target_{fe.RECOMMENDED_TARGET}.csv"
     print(
-        "\n[pipeline] NOTE: target is still undecided by the team -- three "
-        "target-ready CSVs were generated (fev1, fev1_phase2, gold_copd), each "
-        "with the leakage-appropriate columns already dropped for that specific "
-        "target. Pick the matching file once the target is confirmed. See README.md."
+        f"\n[pipeline] RECOMMENDED TARGET: '{fe.RECOMMENDED_TARGET}' -> {recommended_path}\n"
+        "  Train on this one. fev1 / fev1_phase2 CSVs are kept only as "
+        "rejected/reference candidates -- see feature_engineering.py for why."
     )
+    print(f"[pipeline] NOTE (not built yet): {fe.GOLD_STAGE_CASCADE_NOTE}")
 
 
 if __name__ == "__main__":

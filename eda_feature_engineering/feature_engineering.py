@@ -1,21 +1,28 @@
 """Feature engineering for the COPD dataset.
 
-The team has NOT finalized a single prediction target yet. Per
-`DATA_PREPROCESSING.md` (written by whoever owns preprocessing) plus our own
-earlier EDA, there are three live candidates:
+TARGET DECISION (per team discussion, 2026-07-16 evening): regression on
+`fev1_phase2` hit an RMSE ceiling -- the only strongly correlated feature is
+baseline `fev1` itself, and a single predicted number isn't useful in
+production anyway. The team is switching to classification:
 
-  - `fev1`            -- baseline FEV1 (current lung function). Regression.
-  - `fev1_phase2`      -- FEV1 measured five years after baseline (per the
-                          spirometry data dictionary: "FEV1 five years
-                          later"). Regression -- predicts lung-function
-                          decline, not a repeat of the baseline test.
-  - `gold_copd`        -- derived: `fev1_fvc_ratio < 0.70` (the GOLD
-                          diagnostic criterion for airflow obstruction).
-                          Classification.
+  - `gold_copd` (RECOMMENDED_TARGET) -- derived: `fev1_fvc_ratio < 0.70` (the
+    GOLD diagnostic criterion for airflow obstruction). Binary
+    classification: does this participant have COPD or not.
+  - `fev1` / `fev1_phase2` -- kept as reference/rejected candidates, not for
+    modeling. They're the evidence for *why* the team pivoted (worth keeping
+    for the presentation), not something to train the real model on.
 
-Rather than guessing which one wins, this module builds a leakage-correct,
-target-ready dataset for all three, so whichever gets picked is already sitting
-in `output/` with the right columns dropped.
+NOT built here yet: a second-stage "if COPD-positive, predict GOLD stage
+severity (1-4)" cascade, which the team also discussed. Real GOLD staging
+needs age/sex/height-adjusted % predicted FEV1 (reference equations), which is
+what the NHANES data being pulled in separately is for. Building a competing
+version of that here risks duplicating/conflicting with that work -- it's a
+documented future extension (see GOLD_STAGE_CASCADE_NOTE below), not
+implemented.
+
+This module still builds a leakage-correct, target-ready dataset for all
+three candidates (see TARGET_CANDIDATES), so the rejected ones stay available
+for comparison even though gold_copd is the one to actually model on.
 """
 
 from __future__ import annotations
@@ -37,38 +44,30 @@ RESPIRATORY_COLUMN = "respiratory"
 
 GOLD_THRESHOLD = 0.70
 
+RECOMMENDED_TARGET = "gold_copd"
+
+# Second-stage cascade the team also discussed (binary COPD -> if positive,
+# predict GOLD stage severity 1-4). NOT implemented here: real GOLD staging
+# needs age/sex/height-adjusted % predicted FEV1, which depends on the NHANES
+# reference data someone else on the team is integrating separately. Building
+# our own version now would risk a second divergent implementation of the
+# same thing -- wire this in once that reference data/equation is shared,
+# don't reinvent it here.
+GOLD_STAGE_CASCADE_NOTE = (
+    "Planned second-stage target, not yet built: for gold_copd-positive rows, "
+    "classify GOLD stage severity (1-4). Needs % predicted FEV1 from "
+    "age/sex/height-adjusted reference equations (NHANES-based work in "
+    "progress elsewhere on the team) -- do not build a competing version "
+    "of this independently."
+)
+
 # For each candidate target: which OTHER columns must be dropped from the
 # feature set, and why. Columns not listed here are safe to keep as features
 # for that target. `sid` is never a feature for any target -- it's kept in
 # the output CSV for traceability only (see README.md).
 TARGET_CANDIDATES = {
-    "fev1": {
-        "kind": "regression",
-        "description": "Baseline FEV1 (current lung function).",
-        "excluded_features": ["fev1_fvc_ratio", "fev1_phase2", "gold_copd"],
-        "exclusion_reasoning": {
-            "fev1_fvc_ratio": "fev1 = fev1_fvc_ratio * fvc almost exactly -> direct leakage.",
-            "fev1_phase2": (
-                "measured five years after baseline -> not available at "
-                "prediction time for a baseline target (it's a separate "
-                "candidate target, not a feature)."
-            ),
-            "gold_copd": "derived from fev1_fvc_ratio, which already leaks fev1 -> same leakage, one step removed.",
-        },
-    },
-    "fev1_phase2": {
-        "kind": "regression",
-        "description": "FEV1 measured five years after baseline -- predicts lung-function decline.",
-        "excluded_features": [],
-        "exclusion_reasoning": {
-            "_none": (
-                "fev1, fvc, fev1_fvc_ratio, and gold_copd are all baseline "
-                "values known before the 5-year follow-up, so they're "
-                "legitimate predictors here -- no leakage."
-            ),
-        },
-    },
     "gold_copd": {
+        "status": "recommended -- team decision, 2026-07-16",
         "kind": "classification",
         "description": f"GOLD criterion: fev1_fvc_ratio < {GOLD_THRESHOLD} (airflow obstruction).",
         "excluded_features": ["fev1_fvc_ratio", "fev1", "fev1_phase2"],
@@ -80,6 +79,35 @@ TARGET_CANDIDATES = {
                 "drop fev1, keep fvc alone as the spirometry input."
             ),
             "fev1_phase2": "measured five years after baseline -- not available at prediction time.",
+        },
+    },
+    "fev1_phase2": {
+        "status": "rejected -- RMSE ceiling (only fev1 correlates), not production-useful as a single number",
+        "kind": "regression",
+        "description": "FEV1 measured five years after baseline -- predicts lung-function decline.",
+        "excluded_features": [],
+        "exclusion_reasoning": {
+            "_none": (
+                "fev1, fvc, fev1_fvc_ratio, and gold_copd are all baseline "
+                "values known before the 5-year follow-up, so they're "
+                "legitimate predictors here -- no leakage. (Kept for "
+                "reference/comparison only -- not the modeling target.)"
+            ),
+        },
+    },
+    "fev1": {
+        "status": "reference only -- not a target the team is pursuing",
+        "kind": "regression",
+        "description": "Baseline FEV1 (current lung function).",
+        "excluded_features": ["fev1_fvc_ratio", "fev1_phase2", "gold_copd"],
+        "exclusion_reasoning": {
+            "fev1_fvc_ratio": "fev1 = fev1_fvc_ratio * fvc almost exactly -> direct leakage.",
+            "fev1_phase2": (
+                "measured five years after baseline -> not available at "
+                "prediction time for a baseline target (it's a separate "
+                "candidate target, not a feature)."
+            ),
+            "gold_copd": "derived from fev1_fvc_ratio, which already leaks fev1 -> same leakage, one step removed.",
         },
     },
 }
@@ -129,6 +157,8 @@ def engineer_features(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
         out[col] = out[col].astype("category")
 
     manifest = {
+        "recommended_target": RECOMMENDED_TARGET,
+        "gold_stage_cascade_note": GOLD_STAGE_CASCADE_NOTE,
         "target_candidates": TARGET_CANDIDATES,
         "reference_columns_not_features": {
             "sid": "subject identifier -- kept in the CSV for traceability, never a feature for any target.",
