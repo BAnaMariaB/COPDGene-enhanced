@@ -237,6 +237,14 @@ data/**
 !data/raw/
 !data/raw/.gitkeep
 
+# NHANES 2011-2012 primary dataset — tracked so the team can model without re-downloading.
+!data/raw/nhanes/
+!data/raw/nhanes/**
+!data/preprocessed/
+!data/preprocessed/nhanes_copd_cohort.csv
+!data/preprocessed/2026-07-16/
+!data/preprocessed/2026-07-16/**
+
 # EDA & feature-engineering staging area — generated raw copies/outputs, keep folder structure only
 eda_feature_engineering/raw/**
 !eda_feature_engineering/raw/.gitkeep
