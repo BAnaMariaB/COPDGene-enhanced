@@ -110,6 +110,73 @@ export COPD_ARTIFACT_ROOT=/your/artifacts/zone
 - **Raw fidelity** — files are written from `response.content` (raw bytes),
   never decoded or reformatted.
 
+## Training / validation / testing DAG
+
+The second DAG, `copd_train_validate_test`, consumes the preprocessed dataset
+produced by `copd_ingestion` (`data/preprocessed/<ds>/central_preprocessed_dataset.csv`)
+and trains a single **multi-class classifier** to predict the **FEV1 phase 2
+severity class** (`fev1_phase2`). The numeric target is binned into three balanced
+text classes using the training-set tertiles, then encoded with
+`sklearn.preprocessing.LabelEncoder`:
+
+- `low` — bottom third of FEV1 phase 2 values
+- `medium` — middle third of FEV1 phase 2 values
+- `high` — top third of FEV1 phase 2 values
+
+### Modeling pipeline
+
+1. `load_data` — reads the preprocessed CSV, derives the three balanced classes from the tertiles of `fev1_phase2`, encodes them with `LabelEncoder`, and splits into train / validation / test (70/15/15) with stratification.
+2. `train_ensemble` — trains the single `COPDEnsembleClassifier` system, which fits all base classifiers on the same training data and then trains a LogisticRegression meta-learner on their validation-set class probabilities.
+3. `evaluate_ensemble` — computes accuracy, precision, recall, `f1_macro`, and `roc_auc_ovr` on the held-out test set for the ensemble system.
+4. `select_champion` — writes the champion record JSON for the ensemble system using `f1_macro` as the champion metric.
+5. `complete` — final marker.
+
+### MLflow tracking
+
+Set these environment variables to control tracking:
+
+- `MLFLOW_TRACKING_URI` — defaults to a local SQLite database (`sqlite:///.../mlflow.db`).
+- `MLFLOW_EXPERIMENT_NAME` — defaults to `copd_fev1_phase2_classification`.
+- `COPD_PREPROCESSED_ROOT` — defaults to `~/airflow/data/preprocessed`.
+- `COPD_ARTIFACT_ROOT` — defaults to `~/airflow/data/artifacts`.
+- `COPD_TARGET_COLUMN` — defaults to `fev1_phase2`.
+
+To use S3 for artifact storage later, set the standard MLflow S3 variables before
+starting Airflow (no code changes are required):
+
+```bash
+export MLFLOW_TRACKING_URI=http://your-mlflow-server:5000
+export MLFLOW_ARTIFACT_ROOT=s3://your-bucket/mlflow-artifacts
+export AWS_ACCESS_KEY_ID=...
+export AWS_SECRET_ACCESS_KEY=...
+export AWS_REGION=...
+```
+
+### Champion table (PostgreSQL, future work)
+
+The DAG does **not** connect to PostgreSQL yet. It writes a champion record to
+`data/artifacts/<ds>/champion.json` with the exact schema a future
+`champion_models` table expects:
+
+```json
+{
+  "model_name": "copd_ensemble",
+  "mlflow_run_id": "...",
+  "experiment_id": "...",
+  "metric_name": "f1_macro",
+  "metric_value": 0.828,
+  "partition_ds": "2026-07-16",
+  "artifact_uri": "...",
+  "model_type": "COPDEnsembleClassifier",
+  "params": { ... },
+  "dag_run_id": "...",
+  "registered_at": "..."
+}
+```
+
+A future task owner can read this JSON and insert it into the PSQL
+`champion_models` table using an Airflow connection.
+
 ## Handoff to colleagues
 
 Downstream (preparation/transformation) reads from `data/raw/<source>/<date>/`.
