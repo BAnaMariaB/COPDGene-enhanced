@@ -1,0 +1,84 @@
+<svg viewBox="0 0 1060 720" xmlns="http://www.w3.org/2000/svg" role="img" font-family="Inter, system-ui, sans-serif">
+<title>COPD prediction system architecture</title>
+<desc>A serving plane (Gradio and FastAPI on AWS Elastic Beanstalk behind Cloudflare) and an offline training plane (Airflow and MLflow), meeting at shared PostgreSQL and S3 storage.</desc>
+<defs>
+<marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#475569"/></marker>
+<marker id="arb" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#2563eb"/></marker>
+</defs>
+
+<rect x="0" y="0" width="1060" height="720" fill="#ffffff"/>
+<text x="530" y="32" text-anchor="middle" font-size="20" font-weight="700" fill="#0f172a">COPD Prediction — System Architecture</text>
+<rect x="742" y="44" width="12" height="12" rx="2" fill="#eff6ff" stroke="#2563eb"/>
+<text x="760" y="54" font-size="11" fill="#334155">deployed / online</text>
+<rect x="880" y="44" width="12" height="12" rx="2" fill="#f1f5f9" stroke="#475569"/>
+<text x="898" y="54" font-size="11" fill="#334155">dev / offline</text>
+
+<rect x="20" y="74" width="1020" height="132" rx="10" fill="#f5f9ff"/>
+<rect x="20" y="238" width="1020" height="118" rx="10" fill="#fafafa"/>
+<rect x="20" y="388" width="1020" height="146" rx="10" fill="#f6f8fa"/>
+
+<text x="36" y="94" font-size="13" font-weight="700" fill="#1e40af">SERVING PLANE — deployed (AWS Elastic Beanstalk + Cloudflare)</text>
+<rect x="40" y="112" width="110" height="58" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
+<text x="95" y="146" text-anchor="middle" font-size="12" fill="#1e3a8a">User / browser</text>
+<rect x="200" y="112" width="150" height="58" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
+<text x="275" y="137" text-anchor="middle" font-size="12.5" font-weight="600" fill="#1e3a8a">Cloudflare</text>
+<text x="275" y="153" text-anchor="middle" font-size="10.5" fill="#475569">DNS · TLS · CDN</text>
+
+<rect x="400" y="100" width="620" height="98" rx="10" fill="none" stroke="#2563eb" stroke-width="1.3" stroke-dasharray="5 4"/>
+<text x="410" y="116" font-size="10.5" font-weight="600" fill="#2563eb">Elastic Beanstalk — 1 instance (Docker Compose)</text>
+<rect x="418" y="124" width="270" height="60" rx="8" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+<text x="553" y="149" text-anchor="middle" font-size="12.5" font-weight="600" fill="#1e3a8a">Gradio UI (Blocks)</text>
+<text x="553" y="165" text-anchor="middle" font-size="10.5" fill="#475569">public :80</text>
+<rect x="732" y="124" width="270" height="60" rx="8" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+<text x="867" y="149" text-anchor="middle" font-size="12.5" font-weight="600" fill="#1e3a8a">FastAPI backend</text>
+<text x="867" y="165" text-anchor="middle" font-size="10.5" fill="#475569">internal :8000</text>
+
+<line x1="150" y1="141" x2="196" y2="141" stroke="#2563eb" stroke-width="1.5" marker-end="url(#arb)"/>
+<line x1="350" y1="141" x2="414" y2="154" stroke="#2563eb" stroke-width="1.5" marker-end="url(#arb)"/>
+<text x="372" y="136" font-size="10" fill="#2563eb">HTTPS</text>
+<line x1="688" y1="154" x2="728" y2="154" stroke="#2563eb" stroke-width="1.5" marker-end="url(#arb)"/>
+<text x="694" y="147" font-size="10" fill="#2563eb">/predict</text>
+
+<text x="36" y="258" font-size="13" font-weight="700" fill="#334155">SHARED STATE</text>
+<rect x="418" y="270" width="270" height="72" rx="8" fill="#ffffff" stroke="#334155" stroke-width="1.5"/>
+<text x="553" y="300" text-anchor="middle" font-size="12.5" font-weight="600" fill="#0f172a">PostgreSQL</text>
+<text x="553" y="317" text-anchor="middle" font-size="10.5" fill="#475569">champion registry table</text>
+<text x="553" y="331" text-anchor="middle" font-size="10.5" fill="#475569">+ Airflow / MLflow store</text>
+<rect x="732" y="270" width="270" height="72" rx="8" fill="#ffffff" stroke="#334155" stroke-width="1.5"/>
+<text x="867" y="303" text-anchor="middle" font-size="12.5" font-weight="600" fill="#0f172a">S3 artifact store</text>
+<text x="867" y="320" text-anchor="middle" font-size="10.5" fill="#475569">champion model binary</text>
+
+<line x1="867" y1="184" x2="867" y2="266" stroke="#2563eb" stroke-width="1.5" marker-end="url(#arb)"/>
+<text x="874" y="230" font-size="10" fill="#2563eb">load model</text>
+<line x1="800" y1="184" x2="640" y2="266" stroke="#2563eb" stroke-width="1.5" marker-end="url(#arb)"/>
+<text x="655" y="228" font-size="10" fill="#2563eb">read champion</text>
+
+<text x="36" y="408" font-size="13" font-weight="700" fill="#334155">TRAINING PLANE — offline (dev): Airflow + MLflow</text>
+<rect x="40" y="424" width="168" height="66" rx="8" fill="#f1f5f9" stroke="#475569" stroke-width="1.5"/>
+<text x="124" y="452" text-anchor="middle" font-size="12" font-weight="600" fill="#0f172a">Airflow</text>
+<text x="124" y="468" text-anchor="middle" font-size="10" fill="#475569">copd_ingestion DAG</text>
+<rect x="238" y="424" width="118" height="66" rx="8" fill="#f1f5f9" stroke="#475569" stroke-width="1.5"/>
+<text x="297" y="454" text-anchor="middle" font-size="11.5" fill="#0f172a">Raw zone</text>
+<text x="297" y="469" text-anchor="middle" font-size="9.5" fill="#475569">+ preprocess</text>
+<rect x="386" y="424" width="150" height="66" rx="8" fill="#f1f5f9" stroke="#475569" stroke-width="1.5"/>
+<text x="461" y="452" text-anchor="middle" font-size="11.5" fill="#0f172a">central CSV</text>
+<text x="461" y="468" text-anchor="middle" font-size="9.5" fill="#475569">+ artifacts</text>
+<rect x="566" y="424" width="168" height="66" rx="8" fill="#f1f5f9" stroke="#475569" stroke-width="1.5"/>
+<text x="650" y="452" text-anchor="middle" font-size="12" font-weight="600" fill="#0f172a">Airflow</text>
+<text x="650" y="468" text-anchor="middle" font-size="10" fill="#475569">train / validate DAG</text>
+<rect x="764" y="424" width="196" height="66" rx="8" fill="#f1f5f9" stroke="#475569" stroke-width="1.5"/>
+<text x="862" y="452" text-anchor="middle" font-size="12" font-weight="600" fill="#0f172a">MLflow</text>
+<text x="862" y="468" text-anchor="middle" font-size="10" fill="#475569">runs · metrics · registry</text>
+
+<line x1="208" y1="457" x2="234" y2="457" stroke="#475569" stroke-width="1.4" marker-end="url(#ar)"/>
+<line x1="356" y1="457" x2="382" y2="457" stroke="#475569" stroke-width="1.4" marker-end="url(#ar)"/>
+<line x1="536" y1="457" x2="562" y2="457" stroke="#475569" stroke-width="1.4" marker-end="url(#ar)"/>
+<line x1="734" y1="457" x2="760" y2="457" stroke="#475569" stroke-width="1.4" marker-end="url(#ar)"/>
+
+<line x1="862" y1="424" x2="867" y2="346" stroke="#475569" stroke-width="1.5" marker-end="url(#ar)"/>
+<text x="874" y="392" font-size="10" fill="#475569">store artifact</text>
+<line x1="650" y1="424" x2="560" y2="346" stroke="#475569" stroke-width="1.5" marker-end="url(#ar)"/>
+<text x="556" y="392" font-size="10" fill="#475569">write champion</text>
+
+<text x="530" y="700" text-anchor="middle" font-size="11" fill="#64748b">Training produces the champion (offline); serving loads it and predicts (deployed). The two planes meet only at PostgreSQL + S3.</text>
+</svg>
