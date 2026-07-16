@@ -15,6 +15,7 @@ dependencies = [
     # (2.31.x) during local dev, and won't get force-downgraded.
     "requests>=2.31,<3",
     "pandas>=2.2,<3",
+    "lxml>=5.0,<6",  # pandas.read_html parser used by the spirometry preprocessing task
     "scikit-learn>=1.5,<2",
     "joblib>=1.4,<2",
 ]

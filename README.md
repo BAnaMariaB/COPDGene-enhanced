@@ -129,3 +129,5 @@ export COPD_ARTIFACT_ROOT=/your/artifacts/zone
 Downstream (preparation/transformation) reads from `data/raw/<source>/<date>/`.
 The pipeline guarantees the file is present and unchanged from source; it makes
 no guarantees about the file's internal schema or quality — that is their layer.
+For the preprocessing step that merges the three core `sid`-keyed sources and
+produces the model-ready dataset, see [`DATA_PREPROCESSING.md`](DATA_PREPROCESSING.md).
