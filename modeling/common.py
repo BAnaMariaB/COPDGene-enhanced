@@ -158,3 +158,38 @@ def artifact_dir(ds: str, model_name: str) -> Path:
     path = root / ds / "models" / model_name
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def drop_nan(metrics: dict) -> dict:
+    """Filter out NaN metric values before logging to MLflow.
+
+    Some splits do not contain every class (GOLD_4 has only 2 records in the
+    whole cohort), so roc_auc_ovr can come back NaN - see
+    classification_metrics. MLflow's SQLite backend does not handle logging
+    NaN metric values reliably, so skip them instead of logging a placeholder.
+    """
+    return {k: v for k, v in metrics.items() if v == v}
+
+
+THRESHOLD_GRID = np.arange(0.05, 0.96, 0.01)
+
+
+def tune_threshold(model, X_val, y_val, positive_code: int, negative_code: int) -> tuple[float, float]:
+    """Sweep thresholds on the positive-class probability, pick the one that
+    maximizes val f1_macro instead of using the implicit 0.5 cutoff."""
+    class_index = list(model.classes_).index(positive_code)
+    proba_positive = model.predict_proba(X_val)[:, class_index]
+
+    best_threshold, best_f1 = 0.5, -1.0
+    for threshold in THRESHOLD_GRID:
+        preds = np.where(proba_positive >= threshold, positive_code, negative_code)
+        f1 = f1_score(y_val, preds, average="macro", zero_division=0)
+        if f1 > best_f1:
+            best_f1, best_threshold = f1, float(threshold)
+    return best_threshold, best_f1
+
+
+def predict_with_threshold(model, X_eval, positive_code: int, negative_code: int, threshold: float) -> np.ndarray:
+    class_index = list(model.classes_).index(positive_code)
+    proba_positive = model.predict_proba(X_eval)[:, class_index]
+    return np.where(proba_positive >= threshold, positive_code, negative_code)
