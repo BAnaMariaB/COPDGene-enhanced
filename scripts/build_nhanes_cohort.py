@@ -229,7 +229,20 @@ def compute_derived_categories(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def select_final_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Return the clean cohort with feature and target columns."""
+    """Return the clean cohort with feature and target columns.
+
+    LEAKAGE FIX (team-approved 2026-07-16): the labels are DERIVED from spirometry
+    (copd_diagnosis = fev1_fvc_ratio < 0.70; gold_stage bucketed from
+    fev1_pct_predicted), and both were already computed in compute_targets(). Those
+    defining columns are therefore dropped from the FEATURE set so a model cannot
+    just read the answer off them:
+      - fev1_fvc_ratio     : the exact value the diagnosis label is thresholded from.
+      - fev1_pct_predicted : the exact value gold_stage is bucketed from.
+      - fev1_ml            : fev1_ml / fvc_ml == fev1_fvc_ratio, so keeping it next
+                             to fvc_ml reconstructs the ratio -> same leakage.
+    fvc_ml is KEPT: on its own it cannot rebuild the ratio, so it stays as a
+    legitimate lung-capacity predictor. Targets (copd_diagnosis, gold_stage) stay.
+    """
     return df[
         [
             "SEQN",
@@ -242,9 +255,6 @@ def select_final_columns(df: pd.DataFrame) -> pd.DataFrame:
             "bmi",
             "bmi_category",
             "fvc_ml",
-            "fev1_ml",
-            "fev1_fvc_ratio",
-            "fev1_pct_predicted",
             "smoking_status",
             "pack_years",
             "copd_diagnosis",
