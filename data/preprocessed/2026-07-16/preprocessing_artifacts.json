@@ -1,0 +1,31 @@
+{
+  "artifact_path": "/home/xenderochefort/Documents/School/EPITA/AIS_S3/MLI/project/COPDGene-enhanced/data/preprocessed/2026-07-16/preprocessing_artifacts.joblib",
+  "numeric_columns": [
+    "age",
+    "sex",
+    "race_ethnicity",
+    "height_cm",
+    "weight_kg",
+    "bmi",
+    "fvc_ml",
+    "fev1_ml",
+    "fev1_fvc_ratio",
+    "fev1_pct_predicted",
+    "pack_years"
+  ],
+  "categorical_columns": [
+    "age_group",
+    "bmi_category",
+    "smoking_status"
+  ],
+  "dropped_leakage_columns": [
+    "SEQN"
+  ],
+  "target_columns": [
+    "copd_diagnosis",
+    "gold_stage"
+  ],
+  "partition_ds": "2026-07-16",
+  "n_rows": 4416,
+  "n_feature_columns": 24
+}

@@ -1,0 +1,182 @@
+{
+  "partition_ds": "2026-07-16",
+  "source_paths": {
+    "demographics": "/home/xenderochefort/Documents/School/EPITA/AIS_S3/MLI/project/COPDGene-enhanced/data/raw/demographics/2026-07-16/demographics.csv",
+    "imaging": "/home/xenderochefort/Documents/School/EPITA/AIS_S3/MLI/project/COPDGene-enhanced/data/raw/imaging/2026-07-16/imaging.json",
+    "spirometry": "/home/xenderochefort/Documents/School/EPITA/AIS_S3/MLI/project/COPDGene-enhanced/data/raw/spirometry/2026-07-16/spirometry.html"
+  },
+  "expected_columns": {
+    "demographics": [
+      "blood_pressure_diastolic",
+      "blood_pressure_systolic",
+      "bmi",
+      "cigs_per_day_avg",
+      "duration_smoking",
+      "gender",
+      "heart_rate",
+      "height_cm",
+      "hours_on_oxygen",
+      "race",
+      "respiratory",
+      "sid",
+      "smoke_start_age",
+      "smoking_status",
+      "visit_age",
+      "visit_date",
+      "visit_year",
+      "weight_kg"
+    ],
+    "imaging": [
+      "emphysema_percentage",
+      "gas_trapping_percentage",
+      "lung_volume_expiratory",
+      "lung_volume_inspiratory",
+      "mean_density_expiratory",
+      "mean_density_inspiratory",
+      "sid"
+    ],
+    "spirometry": [
+      "fev1",
+      "fev1_fvc_ratio",
+      "fev1_phase2",
+      "fvc",
+      "sid"
+    ]
+  },
+  "actual_columns": {
+    "demographics": [
+      "blood_pressure_diastolic",
+      "blood_pressure_systolic",
+      "bmi",
+      "cigs_per_day_avg",
+      "duration_smoking",
+      "gender",
+      "heart_rate",
+      "height_cm",
+      "hours_on_oxygen",
+      "race",
+      "respiratory",
+      "sid",
+      "smoke_start_age",
+      "smoking_status",
+      "visit_age",
+      "visit_date",
+      "visit_year",
+      "weight_kg"
+    ],
+    "imaging": [
+      "emphysema_percentage",
+      "gas_trapping_percentage",
+      "lung_volume_expiratory",
+      "lung_volume_inspiratory",
+      "mean_density_expiratory",
+      "mean_density_inspiratory",
+      "sid"
+    ],
+    "spirometry": [
+      "fev1",
+      "fev1_fvc_ratio",
+      "fev1_phase2",
+      "fvc",
+      "sid"
+    ]
+  },
+  "context_sources_excluded": [
+    "cdc_copd_prevalence",
+    "smoking_prevalence"
+  ],
+  "context_sources_exclusion_reason": "population-level sources with no sid join key; they are landed raw but not merged into the sid-level dataset",
+  "merged_shape": [
+    2620,
+    28
+  ],
+  "dropped_columns": {
+    "leakage": [
+      "sid"
+    ],
+    "non_feature": [
+      "visit_date",
+      "respiratory"
+    ],
+    "all": [
+      "sid",
+      "visit_date",
+      "respiratory"
+    ],
+    "reasons": {
+      "sid": "subject identifier / leakage key",
+      "visit_date": "non-informative string column, not present in other sources",
+      "respiratory": "pipe-delimited free-text, not present in other sources"
+    }
+  },
+  "feature_columns": {
+    "categorical": [
+      "gender",
+      "race",
+      "smoking_status"
+    ],
+    "numeric": [
+      "visit_year",
+      "visit_age",
+      "height_cm",
+      "weight_kg",
+      "blood_pressure_systolic",
+      "blood_pressure_diastolic",
+      "heart_rate",
+      "hours_on_oxygen",
+      "bmi",
+      "smoke_start_age",
+      "cigs_per_day_avg",
+      "duration_smoking",
+      "lung_volume_inspiratory",
+      "emphysema_percentage",
+      "lung_volume_expiratory",
+      "gas_trapping_percentage",
+      "mean_density_inspiratory",
+      "mean_density_expiratory",
+      "fev1_fvc_ratio",
+      "fev1",
+      "fvc",
+      "fev1_phase2"
+    ]
+  },
+  "preprocessed_shape": [
+    2620,
+    28
+  ],
+  "preprocessed_columns": [
+    "gender_1",
+    "gender_2",
+    "race_1",
+    "race_2",
+    "smoking_status_1",
+    "smoking_status_2",
+    "visit_year",
+    "visit_age",
+    "height_cm",
+    "weight_kg",
+    "blood_pressure_systolic",
+    "blood_pressure_diastolic",
+    "heart_rate",
+    "hours_on_oxygen",
+    "bmi",
+    "smoke_start_age",
+    "cigs_per_day_avg",
+    "duration_smoking",
+    "lung_volume_inspiratory",
+    "emphysema_percentage",
+    "lung_volume_expiratory",
+    "gas_trapping_percentage",
+    "mean_density_inspiratory",
+    "mean_density_expiratory",
+    "fev1_fvc_ratio",
+    "fev1",
+    "fvc",
+    "fev1_phase2"
+  ],
+  "output_files": {
+    "central_dataset": "/home/xenderochefort/Documents/School/EPITA/AIS_S3/MLI/project/COPDGene-enhanced/data/preprocessed/2026-07-16/central_preprocessed_dataset.csv",
+    "artifacts": "/home/xenderochefort/Documents/School/EPITA/AIS_S3/MLI/project/COPDGene-enhanced/data/preprocessed/2026-07-16/preprocessing_artifacts.joblib",
+    "summary": "/home/xenderochefort/Documents/School/EPITA/AIS_S3/MLI/project/COPDGene-enhanced/data/preprocessed/2026-07-16/preprocessing_artifacts.json"
+  }
+}
