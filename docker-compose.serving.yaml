@@ -1,0 +1,41 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: registry
+      POSTGRES_PASSWORD: registry
+      POSTGRES_DB: registry
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "registry"]
+      interval: 5s
+      retries: 10
+      start_period: 5s
+
+  api:
+    build:
+      context: .
+      dockerfile: serving/Dockerfile.api
+    environment:
+      CHAMPION_REGISTRY_DATABASE_URL: postgresql://registry:registry@postgres:5432/registry
+      CHAMPION_MODEL_NAME: ${CHAMPION_MODEL_NAME:-copd_double_target_system}
+      CHAMPION_MODEL_TARGET: ${CHAMPION_MODEL_TARGET:-system}
+      MODEL_CACHE_DIR: /tmp/copd_champion_cache
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+
+  ui:
+    build:
+      context: .
+      dockerfile: serving/Dockerfile.ui
+    environment:
+      BACKEND_URL: http://api:8000
+      PORT: 7860
+    depends_on:
+      - api
+    ports:
+      - "7860:7860"

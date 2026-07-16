@@ -109,6 +109,13 @@ MLFLOW_EXPERIMENT_NAME = os.environ.get(
     os.environ.get("COPD_MLFLOW_EXPERIMENT_NAME", "copd_nhanes_double_target_classification"),
 )
 
+# Champion registry (PostgreSQL) for online serving.
+CHAMPION_REGISTRY_DATABASE_URL = os.environ.get("CHAMPION_REGISTRY_DATABASE_URL", "").strip()
+
+# Stable MLflow artifact paths for serving to download.
+MODEL_SYSTEM_ARTIFACT_DIR = "model_system"
+PREPROCESSING_ARTIFACT_FILE = "preprocessing/preprocessing_artifacts.joblib"
+
 # Reproducible train/val/test split sizes.
 TEST_SIZE = float(os.environ.get("COPD_TEST_SIZE", "0.15"))
 VAL_SIZE = float(os.environ.get("COPD_VAL_SIZE", "0.15"))
@@ -212,6 +219,9 @@ def _partition_paths(ds: str) -> dict[str, str]:
     return {
         "preprocessed_dir": preprocessed_dir,
         "preprocessed_csv": os.path.join(preprocessed_dir, "central_preprocessed_dataset.csv"),
+        "preprocessing_joblib": os.path.join(preprocessed_dir, "preprocessing_artifacts.joblib"),
+        "preprocessing_summary": os.path.join(preprocessed_dir, "preprocessing_artifacts.json"),
+        "preprocessing_manifest": os.path.join(preprocessed_dir, "preprocessing_manifest.json"),
         "artifact_dir": artifact_dir,
         "models_dir": os.path.join(artifact_dir, "models"),
         "system_dir": os.path.join(artifact_dir, "models", "copd_double_target_system"),
@@ -1034,7 +1044,15 @@ def copd_train_validate_test():
                 mlflow.log_metrics({f"val_diagnosis_base_{name}_{k}": v for k, v in metrics.items()})
             for name, metrics in val_metrics["gold_stage_base"].items():
                 mlflow.log_metrics({f"val_gold_base_{name}_{k}": v for k, v in metrics.items()})
-            mlflow.log_artifact(paths["system_dir"])
+            # Log the full system + preprocessing artifacts under stable paths so the
+            # serving backend can download them by (run_id, artifact_path).
+            mlflow.log_artifacts(paths["system_dir"], artifact_path=MODEL_SYSTEM_ARTIFACT_DIR)
+            if os.path.exists(paths["preprocessing_joblib"]):
+                mlflow.log_artifact(paths["preprocessing_joblib"], artifact_path="preprocessing")
+            if os.path.exists(paths["preprocessing_summary"]):
+                mlflow.log_artifact(paths["preprocessing_summary"], artifact_path="preprocessing")
+            if os.path.exists(paths["preprocessing_manifest"]):
+                mlflow.log_artifact(paths["preprocessing_manifest"], artifact_path="preprocessing")
 
             mlflow.sklearn.log_model(
                 system.diagnosis_ensemble.fitted_meta_model,
@@ -1063,6 +1081,8 @@ def copd_train_validate_test():
             "gold_n_classes": gold_n_classes,
             "diagnosis_classes": data_info["diagnosis_classes"],
             "gold_classes": data_info["gold_classes"],
+            "model_artifact_path": MODEL_SYSTEM_ARTIFACT_DIR,
+            "preprocessing_artifact_path": PREPROCESSING_ARTIFACT_FILE,
             "params": {
                 "diagnosis_base_models": list(system.diagnosis_ensemble.base_model_configs.keys()),
                 "gold_base_models": list(system.gold_ensemble.base_model_configs.keys()),
@@ -1169,13 +1189,95 @@ def copd_train_validate_test():
             },
         }
 
-    def _register_champion_in_database(record: dict[str, Any]) -> None:
-        """Placeholder for the future PostgreSQL champion-table insertion."""
-        raise NotImplementedError(
-            "PostgreSQL champion registration is intentionally not implemented. "
-            "Use the champion JSON produced by select_champion and insert it into "
-            "the champion_models table using your chosen PSQL connection."
-        )
+    def _register_champion_in_database(record: dict[str, Any]) -> int | None:
+        """Insert the champion record into the Postgres registry table (if configured)."""
+        if not CHAMPION_REGISTRY_DATABASE_URL:
+            print("[registry] CHAMPION_REGISTRY_DATABASE_URL not set; skipping champion registry insert")
+            return None
+
+        try:
+            import psycopg2
+            from psycopg2.extras import Json
+        except Exception as e:  # noqa: BLE001
+            raise RuntimeError(
+                "psycopg2 is required to write champion registry rows; install psycopg2-binary"
+            ) from e
+
+        def _normalize(url: str) -> str:
+            if url.startswith("postgresql+psycopg2://"):
+                return "postgresql://" + url[len("postgresql+psycopg2://") :]
+            return url
+
+        ddl = """
+        CREATE TABLE IF NOT EXISTS champion_models (
+          id BIGSERIAL PRIMARY KEY,
+          model_name TEXT NOT NULL,
+          target TEXT NOT NULL,
+          mlflow_tracking_uri TEXT NOT NULL,
+          mlflow_experiment_name TEXT NOT NULL,
+          mlflow_run_id TEXT NOT NULL,
+          artifact_uri TEXT,
+          model_artifact_path TEXT,
+          preprocessing_artifact_path TEXT,
+          metric_name TEXT,
+          metric_value DOUBLE PRECISION,
+          params_json JSONB,
+          registered_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+          is_active BOOLEAN NOT NULL DEFAULT TRUE
+        );
+        CREATE INDEX IF NOT EXISTS champion_models_active_idx
+          ON champion_models(model_name, target)
+          WHERE is_active;
+        """
+
+        url = _normalize(CHAMPION_REGISTRY_DATABASE_URL)
+        conn = psycopg2.connect(url)
+        try:
+            conn.autocommit = True
+            with conn.cursor() as cur:
+                cur.execute(ddl)
+
+            conn.autocommit = False
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE champion_models SET is_active=FALSE WHERE model_name=%s AND target=%s AND is_active=TRUE",
+                    (record["model_name"], record["target"]),
+                )
+                cur.execute(
+                    """
+                    INSERT INTO champion_models (
+                      model_name, target,
+                      mlflow_tracking_uri, mlflow_experiment_name,
+                      mlflow_run_id, artifact_uri,
+                      model_artifact_path, preprocessing_artifact_path,
+                      metric_name, metric_value,
+                      params_json,
+                      is_active
+                    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,TRUE)
+                    RETURNING id
+                    """,
+                    (
+                        record["model_name"],
+                        record["target"],
+                        MLFLOW_TRACKING_URI,
+                        MLFLOW_EXPERIMENT_NAME,
+                        record["mlflow_run_id"],
+                        record.get("artifact_uri"),
+                        record.get("model_artifact_path"),
+                        record.get("preprocessing_artifact_path"),
+                        record.get("metric_name"),
+                        float(record.get("metric_value")) if record.get("metric_value") is not None else None,
+                        Json(record.get("params_json") or {}),
+                    ),
+                )
+                new_id = int(cur.fetchone()[0])
+            conn.commit()
+            print(
+                f"[registry] upserted champion model_name={record['model_name']} target={record['target']} id={new_id}"
+            )
+            return new_id
+        finally:
+            conn.close()
 
     @task
     def select_champion(
@@ -1205,6 +1307,65 @@ def copd_train_validate_test():
             mlflow.log_metric("champion_gold_stage_f1_macro", champion_records["gold_stage"]["metric_value"])
             mlflow.log_artifact(paths["champion_diagnosis_path"])
             mlflow.log_artifact(paths["champion_gold_path"])
+
+        # Champion registry insert (system + per-target records).
+        test_metrics = eval_info["comparison"]["test_metrics"]
+        system_score = float(
+            (test_metrics["diagnosis"]["f1_macro"] + test_metrics["gold_stage"]["f1_macro"]) / 2.0
+        )
+
+        system_registry_record = {
+            "model_name": champion_records["diagnosis"]["model_name"],
+            "target": "system",
+            "mlflow_run_id": champion_records["diagnosis"]["mlflow_run_id"],
+            "artifact_uri": champion_records["diagnosis"].get("artifact_uri"),
+            "model_artifact_path": ensemble_info.get("model_artifact_path"),
+            "preprocessing_artifact_path": ensemble_info.get("preprocessing_artifact_path"),
+            "metric_name": "system_score_avg_f1_macro",
+            "metric_value": system_score,
+            "params_json": {
+                **(ensemble_info.get("params") or {}),
+                "diagnosis_threshold": test_metrics.get("diagnosis_threshold"),
+                "metrics": {
+                    "diagnosis": test_metrics.get("diagnosis"),
+                    "gold_stage": test_metrics.get("gold_stage"),
+                },
+            },
+        }
+
+        diagnosis_registry_record = {
+            "model_name": champion_records["diagnosis"]["model_name"],
+            "target": "copd_diagnosis",
+            "mlflow_run_id": champion_records["diagnosis"]["mlflow_run_id"],
+            "artifact_uri": champion_records["diagnosis"].get("artifact_uri"),
+            "model_artifact_path": ensemble_info.get("model_artifact_path"),
+            "preprocessing_artifact_path": ensemble_info.get("preprocessing_artifact_path"),
+            "metric_name": champion_records["diagnosis"]["metric_name"],
+            "metric_value": champion_records["diagnosis"]["metric_value"],
+            "params_json": {
+                **(ensemble_info.get("params") or {}),
+                "diagnosis_threshold": test_metrics.get("diagnosis_threshold"),
+            },
+        }
+
+        gold_registry_record = {
+            "model_name": champion_records["gold_stage"]["model_name"],
+            "target": "gold_stage",
+            "mlflow_run_id": champion_records["gold_stage"]["mlflow_run_id"],
+            "artifact_uri": champion_records["gold_stage"].get("artifact_uri"),
+            "model_artifact_path": ensemble_info.get("model_artifact_path"),
+            "preprocessing_artifact_path": ensemble_info.get("preprocessing_artifact_path"),
+            "metric_name": champion_records["gold_stage"]["metric_name"],
+            "metric_value": champion_records["gold_stage"]["metric_value"],
+            "params_json": {
+                **(ensemble_info.get("params") or {}),
+                "diagnosis_threshold": test_metrics.get("diagnosis_threshold"),
+            },
+        }
+
+        _register_champion_in_database(system_registry_record)
+        _register_champion_in_database(diagnosis_registry_record)
+        _register_champion_in_database(gold_registry_record)
 
         dm = eval_info["comparison"]["test_metrics"]["diagnosis"]
         gm = eval_info["comparison"]["test_metrics"]["gold_stage"]
