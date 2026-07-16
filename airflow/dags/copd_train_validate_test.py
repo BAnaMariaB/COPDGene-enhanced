@@ -69,6 +69,7 @@ import numpy as np
 import pandas as pd
 from airflow.sdk import dag, get_current_context, task
 from catboost import CatBoostClassifier
+from lightgbm import LGBMClassifier
 from sklearn.base import clone
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
@@ -140,6 +141,21 @@ DEFAULT_BASE_MODELS = {
         eval_metric="mlogloss",
         random_state=RANDOM_STATE,
         n_jobs=2,
+    ),
+    # LightGBM: boosting base model. Objective (binary vs multiclass) is inferred
+    # automatically from the number of classes in y, so it works for both the
+    # diagnosis and GOLD-stage targets. subsample_freq=1 activates row subsampling.
+    "lightgbm": LGBMClassifier(
+        n_estimators=300,
+        learning_rate=0.05,
+        max_depth=6,
+        num_leaves=31,
+        subsample=0.8,
+        subsample_freq=1,
+        colsample_bytree=0.8,
+        random_state=RANDOM_STATE,
+        n_jobs=2,
+        verbose=-1,
     ),
     "logistic_regression": LogisticRegression(
         max_iter=2000, random_state=RANDOM_STATE
