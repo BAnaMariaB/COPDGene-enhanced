@@ -1,22 +1,20 @@
 """
 COPD data ingestion DAG.
 
-SCOPE: ingestion only. This DAG pulls three raw source files exactly as they are
-published and lands them, unmodified, into a date-partitioned raw zone. It does
-NOT parse, clean, validate schemas, or join the sources — that is downstream work
-owned by other team members.
+SCOPE: ingest the real NHANES 2011-2012 primary dataset, build a COPD cohort with
+derived clinical features, and produce a preprocessed dataset for the training DAG.
 
-Sources (all keyed by `sid`):
-  - demographics : CSV
-  - imaging      : JSON
-  - spirometry   : HTML (contains an HTML <table>)
+Sources (all keyed by `SEQN`):
+  - DEMO_G : demographics (age, sex, race/ethnicity)
+  - SPX_G  : spirometry (FVC, FEV1, quality flags)
+  - BMX_G  : body measures (height, weight, BMI)
+  - SMQ_G  : smoking questionnaire (status, pack-years)
 
-Landing layout (one partition per DAG run date):
-  data/raw/<source>/<YYYY-MM-DD>/<source>.<ext>
-  data/raw/<source>/<YYYY-MM-DD>/<source>.<ext>.meta.json   (ingestion metadata sidecar)
-
-The three source tasks run in parallel; a final `ingestion_complete` marker task
-fans them back in so downstream DAGs can depend on a single point.
+The NHANES files are downloaded once to a shared raw zone. A downstream task then
+merges them, filters to adults with acceptable spirometry, derives clinically
+meaningful features (FEV1/FVC ratio, FEV1 % predicted, GOLD stage, BMI category,
+age group, pack-years), and writes the preprocessed dataset with two target
+columns: `copd_diagnosis` and `gold_stage`.
 """
 
 from __future__ import annotations
@@ -25,10 +23,18 @@ import hashlib
 import json
 import os
 import socket
+import sys
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import requests
 from airflow.sdk import dag, task
+
+# Allow the DAG to import the standalone NHANES cohort builder in scripts/.
+_PROJECT_ROOT = Path(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
+_SCRIPTS_DIR = _PROJECT_ROOT / "scripts"
+if str(_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS_DIR))
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -50,7 +56,28 @@ PREPROCESSED_ROOT = os.environ.get(
     os.path.join(AIRFLOW_HOME, "data", "preprocessed"),
 )
 
-# Each source: logical name -> (url, file extension)
+# NHANES 2011-2012 primary source files. These are real CDC data files used to
+# build a custom COPD cohort, replacing the previous public teaching files.
+NHANES_SOURCES = {
+    "DEMO_G": {
+        "url": "https://wwwn.cdc.gov/Nchs/Data/Nhanes/Public/2011/DataFiles/DEMO_G.xpt",
+        "ext": "xpt",
+    },
+    "SPX_G": {
+        "url": "https://wwwn.cdc.gov/Nchs/Data/Nhanes/Public/2011/DataFiles/SPX_G.xpt",
+        "ext": "xpt",
+    },
+    "BMX_G": {
+        "url": "https://wwwn.cdc.gov/Nchs/Data/Nhanes/Public/2011/DataFiles/BMX_G.xpt",
+        "ext": "xpt",
+    },
+    "SMQ_G": {
+        "url": "https://wwwn.cdc.gov/Nchs/Data/Nhanes/Public/2011/DataFiles/SMQ_G.xpt",
+        "ext": "xpt",
+    },
+}
+
+# Legacy teaching sources (kept for reference, no longer used by default).
 SOURCES = {
     "demographics": {
         "url": "https://raw.githubusercontent.com/khasenst/datasets_teaching/refs/heads/main/copd_data_demographics.csv",
@@ -147,13 +174,13 @@ default_args = {
 
 @dag(
     dag_id="copd_ingestion",
-    description="Ingest raw COPD sources (CSV/JSON/HTML) into a date-partitioned raw zone. Ingestion only.",
+    description="Ingest NHANES 2011-2012 sources and build a COPD cohort with derived clinical features.",
     default_args=default_args,
     start_date=datetime(2024, 1, 1),
     schedule="0 * * * *",  # hourly, at the top of every hour
     catchup=False,
     max_active_runs=1,
-    tags=["copd", "ingestion", "raw"],
+    tags=["copd", "ingestion", "nhanes", "cohort", "raw"],
 )
 def copd_ingestion():
     @task
@@ -161,8 +188,53 @@ def copd_ingestion():
         """Explicit start marker for readability in the task graph."""
 
     @task
-    def preprocessing(demographics_path: str, imaging_path: str, spirometry_path: str) -> str:
-        """Impute missing values and fit reusable preprocessing artifacts."""
+    def nhanes_ingest() -> list[str]:
+        """Ensure the four NHANES 2011-2012 XPT files are present in the raw zone."""
+        from airflow.sdk import get_current_context
+
+        context = get_current_context()
+        ds = context["ds"]
+        nhanes_raw_dir = Path(RAW_ROOT) / "nhanes" / ds
+        nhanes_raw_dir.mkdir(parents=True, exist_ok=True)
+
+        downloaded = []
+        for source_name, cfg in NHANES_SOURCES.items():
+            dest_path = nhanes_raw_dir / f"{source_name}.{cfg['ext']}"
+            if not dest_path.exists():
+                # Re-use the same download logic as ingest_source.
+                session = requests.Session()
+                for attempt in range(1, REQUEST_MAX_RETRIES + 1):
+                    try:
+                        resp = session.get(cfg["url"], timeout=REQUEST_TIMEOUT)
+                        resp.raise_for_status()
+                        break
+                    except requests.RequestException as err:
+                        if attempt == REQUEST_MAX_RETRIES:
+                            raise
+                dest_path.write_bytes(resp.content)
+                print(f"[nhanes] downloaded {source_name}: {len(resp.content)} bytes")
+            else:
+                print(f"[nhanes] using existing {source_name}")
+            downloaded.append(str(dest_path))
+        return downloaded
+
+    @task
+    def build_cohort(nhanes_paths: list[str]) -> str:
+        """Build the NHANES COPD cohort and return the cohort CSV path."""
+        import build_nhanes_cohort as cohort_builder
+
+        cohort_builder.RAW_DIR = Path(nhanes_paths[0]).parent
+        cohort_builder.COHORT_DIR = Path(PREPROCESSED_ROOT)
+        cohort = cohort_builder.build_cohort()
+        cohort_path = cohort_builder.COHORT_DIR / "nhanes_copd_cohort.csv"
+        cohort_builder.COHORT_DIR.mkdir(parents=True, exist_ok=True)
+        cohort.to_csv(cohort_path, index=False)
+        print(f"[cohort] built {len(cohort)} rows -> {cohort_path}")
+        return str(cohort_path)
+
+    @task
+    def preprocessing(cohort_path: str) -> str:
+        """Impute missing values, encode categoricals, and scale numerics."""
         from airflow.sdk import get_current_context
         import joblib
         import pandas as pd
@@ -176,34 +248,32 @@ def copd_ingestion():
         preprocessed_dir = os.path.join(PREPROCESSED_ROOT, ds)
         os.makedirs(preprocessed_dir, exist_ok=True)
 
-        demographics = pd.read_csv(demographics_path)
-        imaging = pd.read_json(imaging_path)
-        spirometry = pd.read_html(spirometry_path)[0]
+        cohort = pd.read_csv(cohort_path)
 
-        merged = demographics.merge(imaging, on="sid", how="outer", suffixes=("_demographics", "_imaging"))
-        merged = merged.merge(spirometry, on="sid", how="outer", suffixes=("", "_spirometry"))
+        # Targets are kept as-is in the output for the training DAG to consume.
+        target_cols = ["copd_diagnosis", "gold_stage"]
+        for col in target_cols:
+            if col not in cohort.columns:
+                raise ValueError(f"Target column '{col}' not found in NHANES cohort")
 
-        if "sid" not in merged.columns:
-            raise ValueError("merged dataset does not contain required sid column")
+        # SEQN is the unique identifier and must not leak into features.
+        leakage_cols = ["SEQN"]
+        feature_df = cohort.drop(columns=leakage_cols + target_cols, errors="ignore")
 
-        lower_columns = {col.lower(): col for col in merged.columns}
         categorical_cols = [
-            lower_columns[name]
-            for name in ("gender", "race", "smoking_status")
-            if name in lower_columns
+            col
+            for col in feature_df.columns
+            if feature_df[col].dtype.name in ("category", "object")
         ]
-        leakage_cols = [col for col in ("sid",) if col in merged.columns]
         numeric_cols = [
             col
-            for col in merged.columns
-            if col not in categorical_cols + leakage_cols
-            and pd.api.types.is_numeric_dtype(merged[col])
+            for col in feature_df.columns
+            if col not in categorical_cols
+            and pd.api.types.is_numeric_dtype(feature_df[col])
         ]
 
         if not categorical_cols and not numeric_cols:
-            raise ValueError("no usable feature columns found after applying the ColumnTransformer rules")
-
-        feature_df = merged.drop(columns=leakage_cols, errors="ignore")
+            raise ValueError("no usable feature columns found in NHANES cohort")
 
         preprocessor = ColumnTransformer(
             transformers=[
@@ -235,20 +305,25 @@ def copd_ingestion():
             verbose_feature_names_out=False,
         )
 
-        preprocessed_array = preprocessor.fit_transform(feature_df)
-        preprocessed_columns = preprocessor.get_feature_names_out()
-        preprocessed_df = pd.DataFrame(preprocessed_array, columns=preprocessed_columns, index=feature_df.index)
+        X_array = preprocessor.fit_transform(feature_df)
+        X_columns = preprocessor.get_feature_names_out()
+        # XGBoost rejects feature names containing brackets or angle brackets.
+        X_columns_clean = [
+            col.replace("[", "_").replace("]", "_").replace("<", "_").replace(">", "_")
+            for col in X_columns
+        ]
+        X_df = pd.DataFrame(X_array, columns=X_columns_clean, index=feature_df.index)
+
+        # Add the raw targets back so the training DAG can split them.
+        preprocessed_df = pd.concat([X_df, cohort[target_cols].reset_index(drop=True)], axis=1)
 
         artifacts = {
             "preprocessor": preprocessor,
             "numeric_columns": numeric_cols,
             "categorical_columns": categorical_cols,
             "dropped_leakage_columns": leakage_cols,
-            "source_paths": {
-                "demographics": demographics_path,
-                "imaging": imaging_path,
-                "spirometry": spirometry_path,
-            },
+            "target_columns": target_cols,
+            "source_path": cohort_path,
             "partition_ds": ds,
         }
 
@@ -263,7 +338,10 @@ def copd_ingestion():
                     "numeric_columns": numeric_cols,
                     "categorical_columns": categorical_cols,
                     "dropped_leakage_columns": leakage_cols,
+                    "target_columns": target_cols,
                     "partition_ds": ds,
+                    "n_rows": len(preprocessed_df),
+                    "n_feature_columns": len(X_columns_clean),
                 },
                 fh,
                 indent=2,
@@ -280,25 +358,12 @@ def copd_ingestion():
         print(f"[preprocess] artifacts saved at {preprocessing_artifacts_path}")
 
     start_task = start()
-    demographics_task = ingest_source(
-        source_name="demographics",
-        url=SOURCES["demographics"]["url"],
-        ext=SOURCES["demographics"]["ext"],
-    )
-    imaging_task = ingest_source(
-        source_name="imaging",
-        url=SOURCES["imaging"]["url"],
-        ext=SOURCES["imaging"]["ext"],
-    )
-    spirometry_task = ingest_source(
-        source_name="spirometry",
-        url=SOURCES["spirometry"]["url"],
-        ext=SOURCES["spirometry"]["ext"],
-    )
-    preprocessing_task = preprocessing(demographics_task, imaging_task, spirometry_task)
+    nhanes_paths = nhanes_ingest()
+    cohort_path = build_cohort(nhanes_paths)
+    preprocessing_task = preprocessing(cohort_path)
     complete_task = ingestion_complete(preprocessing_task)
 
-    start_task >> [demographics_task, imaging_task, spirometry_task] >> preprocessing_task >> complete_task
+    start_task >> nhanes_paths >> cohort_path >> preprocessing_task >> complete_task
 
 
 copd_dag = copd_ingestion()
