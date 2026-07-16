@@ -1,0 +1,75 @@
+# Application layer: model registry DB + MLflow + FastAPI + React.
+#
+# Kept separate from docker-compose.yaml (the Airflow stack) so the two can be
+# brought up independently while modeling is still in flux:
+#
+#   docker compose -f docker-compose.app.yaml up -d
+#   frontend  -> http://localhost:5173
+#   backend   -> http://localhost:8000/docs
+#   mlflow    -> http://localhost:5000
+#
+# The backend reads the serving preprocessor from ./data/preprocessed, which is
+# the same host directory the ingestion DAG writes to. Merge this into the main
+# compose file once the modeling DAG is producing real artifacts.
+
+services:
+  app-postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: copd
+      POSTGRES_PASSWORD: copd
+      POSTGRES_DB: copd
+    ports:
+      - "5433:5432"   # 5433 on the host: 5432 belongs to the Airflow metadata DB
+    volumes:
+      - app-db-volume:/var/lib/postgresql/data
+      - ./app/db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "copd"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    restart: always
+
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v2.16.2
+    command: >
+      mlflow server
+      --host 0.0.0.0
+      --port 5000
+      --backend-store-uri sqlite:////mlflow/mlflow.db
+      --default-artifact-root /mlflow/artifacts
+    ports:
+      - "5001:5000"        # was "5000:5000" (5000 is AirPlay Receiver on macOS)
+    volumes:
+      - mlflow-volume:/mlflow
+    restart: always
+
+  backend:
+    build: ./app/backend
+    environment:
+      COPD_DATABASE_URL: postgresql+psycopg://copd:copd@app-postgres:5432/copd
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      COPD_PREPROCESSED_ROOT: /data/preprocessed
+      COPD_CORS_ORIGINS: http://localhost:5173,http://localhost
+    ports:
+      - "8000:8000"
+    volumes:
+      # Read-only: the API consumes pipeline artifacts, never writes them.
+      - ./data/preprocessed:/data/preprocessed:ro
+    depends_on:
+      app-postgres:
+        condition: service_healthy
+    restart: always
+
+  frontend:
+    build: ./app/frontend
+    ports:
+      - "5173:80"
+    depends_on:
+      - backend
+    restart: always
+
+volumes:
+  app-db-volume:
+  mlflow-volume:
