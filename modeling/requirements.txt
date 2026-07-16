@@ -1,0 +1,9 @@
+# Deps for standalone candidate-model scripts in this folder.
+# Airflow itself is not required here - these scripts read the preprocessed
+# CSV directly and log to the same MLflow tracking store as the DAG.
+pandas>=2.2,<3
+numpy>=1.26,<3
+scikit-learn>=1.5,<2
+mlflow>=2.14,<3
+xgboost>=2.0,<3
+joblib>=1.4,<2
