@@ -47,6 +47,10 @@ Artifact layout (per run date):
   │       ├── diagnosis_ensemble/
   │       ├── gold_ensemble/
   │       └── label_encoders.json
+  ├── plots/
+  │   ├── ensemble_test_metrics.png
+  │   ├── lightgbm_test_metrics.png
+  │   └── best_of_both_test_metrics.png
   ├── splits/
   │   ├── X_train.csv, X_val.csv, X_test.csv
   │   ├── y_diagnosis_*.npy, y_gold_*.npy
@@ -64,6 +68,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import joblib
+import matplotlib
 import mlflow
 import mlflow.sklearn
 import mlflow.xgboost
@@ -86,6 +91,9 @@ from sklearn.model_selection import StratifiedKFold, train_test_split
 from sklearn.preprocessing import LabelEncoder
 from sklearn.utils.class_weight import compute_sample_weight
 from xgboost import XGBClassifier
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -161,6 +169,16 @@ TUNE_DIAGNOSIS_THRESHOLD_FOR = os.environ.get(
 # integer encoding from the observed values in the partition.
 DIAGNOSIS_CLASS_LABELS = ["no_copd", "copd"]
 GOLD_CLASS_LABELS = ["GOLD_0", "GOLD_1", "GOLD_2", "GOLD_3", "GOLD_4"]
+METRIC_PLOT_ORDER = [
+    "accuracy",
+    "precision_macro",
+    "recall_macro",
+    "f1_macro",
+    "precision_weighted",
+    "recall_weighted",
+    "f1_weighted",
+    "roc_auc_ovr",
+]
 
 # Leakage guard: these columns are used to DEFINE the targets. If kept as
 # features, the task becomes close to deterministic and yields misleadingly high
@@ -252,6 +270,7 @@ def _partition_paths(ds: str) -> dict[str, str]:
         "diagnosis_ensemble_dir": os.path.join(artifact_dir, "models", "copd_double_target_system", "diagnosis_ensemble"),
         "gold_ensemble_dir": os.path.join(artifact_dir, "models", "copd_double_target_system", "gold_ensemble"),
         "candidates_dir": os.path.join(artifact_dir, CANDIDATE_ARTIFACT_ROOT),
+        "plots_dir": os.path.join(artifact_dir, "plots"),
         "metrics_path": os.path.join(artifact_dir, "test_metrics.json"),
         "champion_diagnosis_path": os.path.join(artifact_dir, "champion_diagnosis.json"),
         "champion_gold_path": os.path.join(artifact_dir, "champion_gold_stage.json"),
@@ -327,6 +346,67 @@ def _probability_distribution_summary(values: np.ndarray) -> dict[str, Any]:
             for idx in range(len(hist))
         ],
     }
+
+
+def _save_candidate_metrics_plot(
+    candidate_name: str,
+    test_metrics: dict[str, Any],
+    output_path: str,
+) -> None:
+    """Render one matplotlib figure per candidate with both tasks side by side."""
+    diagnosis_metrics = test_metrics.get("diagnosis", {})
+    gold_metrics = test_metrics.get("gold_stage", {})
+    metric_names = [
+        metric
+        for metric in METRIC_PLOT_ORDER
+        if metric in diagnosis_metrics or metric in gold_metrics
+    ]
+    if not metric_names:
+        return
+
+    diagnosis_values = [float(diagnosis_metrics.get(metric, 0.0)) for metric in metric_names]
+    gold_values = [float(gold_metrics.get(metric, 0.0)) for metric in metric_names]
+
+    labels = [name.replace("_", "\n") for name in metric_names]
+    positions = np.arange(len(metric_names))
+
+    fig, axes = plt.subplots(1, 2, figsize=(15, 6), sharey=True)
+    fig.patch.set_facecolor("#f4f7fb")
+
+    plot_config = [
+        (axes[0], "COPD Diagnosis", diagnosis_values, "#1d4ed8"),
+        (axes[1], "GOLD Stage", gold_values, "#0f766e"),
+    ]
+    for axis, task_name, values, color in plot_config:
+        bars = axis.bar(positions, values, color=color, alpha=0.9, width=0.65)
+        axis.set_title(task_name, fontsize=12, fontweight="bold")
+        axis.set_xticks(positions)
+        axis.set_xticklabels(labels, rotation=0, ha="center", fontsize=9)
+        axis.set_ylim(0.0, 1.05)
+        axis.grid(axis="y", linestyle="--", alpha=0.25)
+        axis.set_axisbelow(True)
+        for bar, value in zip(bars, values):
+            axis.text(
+                bar.get_x() + bar.get_width() / 2.0,
+                min(value + 0.02, 1.03),
+                f"{value:.3f}",
+                ha="center",
+                va="bottom",
+                fontsize=8,
+            )
+
+    axes[0].set_ylabel("Score", fontsize=10)
+    threshold = test_metrics.get("diagnosis_threshold")
+    threshold_suffix = f" | diagnosis_threshold={threshold:.2f}" if isinstance(threshold, (int, float)) else ""
+    fig.suptitle(
+        f"{candidate_name} test-set metrics by task{threshold_suffix}",
+        fontsize=14,
+        fontweight="bold",
+    )
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.95))
+    _ensure_dir(os.path.dirname(output_path))
+    fig.savefig(output_path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
 
 
 def _build_targets(
@@ -1827,6 +1907,8 @@ def copd_train_validate_test():
             system_score = float(
                 (test_metrics["diagnosis"]["f1_macro"] + test_metrics["gold_stage"]["f1_macro"]) / 2.0
             )
+            metrics_plot_path = os.path.join(paths["plots_dir"], f"{name}_test_metrics.png")
+            _save_candidate_metrics_plot(name, test_metrics, metrics_plot_path)
 
             # Log test metrics back into each candidate's MLflow run.
             mlflow.start_run(run_id=info["mlflow_run_id"])
@@ -1837,6 +1919,11 @@ def copd_train_validate_test():
                 mlflow.log_metrics({f"test_diagnosis_base_{base_name}_{k}": v for k, v in metrics.items()})
             for base_name, metrics in test_metrics.get("gold_stage_base", {}).items():
                 mlflow.log_metrics({f"test_gold_base_{base_name}_{k}": v for k, v in metrics.items()})
+            if os.path.exists(metrics_plot_path):
+                mlflow.log_artifact(
+                    metrics_plot_path,
+                    artifact_path=f"{CANDIDATE_ARTIFACT_ROOT}/{name}/evaluation",
+                )
             mlflow.end_run()
 
             candidates[name] = {
@@ -1848,6 +1935,7 @@ def copd_train_validate_test():
                 "preprocessing_artifact_path": info.get("preprocessing_artifact_path"),
                 "system_score": system_score,
                 "test_metrics": test_metrics,
+                "metrics_plot_path": metrics_plot_path,
             }
 
         enabled_candidates = [c for c in candidates.values() if not c.get("disabled")]
@@ -1876,6 +1964,12 @@ def copd_train_validate_test():
             mlflow.log_param("experiment_id", experiment_id)
             mlflow.log_param("champion_candidate", champion_candidate)
             mlflow.log_artifact(paths["metrics_path"])
+            for candidate in candidates.values():
+                if candidate.get("disabled"):
+                    continue
+                metrics_plot_path = candidate.get("metrics_plot_path")
+                if metrics_plot_path and os.path.exists(metrics_plot_path):
+                    mlflow.log_artifact(metrics_plot_path, artifact_path="candidate_metric_plots")
             evaluation_run_id = run.info.run_id
 
         return {
