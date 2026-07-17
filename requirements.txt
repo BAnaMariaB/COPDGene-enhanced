@@ -2,7 +2,7 @@
 # In docker this is installed via _PIP_ADDITIONAL_REQUIREMENTS (see .env / docker-compose).
 # Listed here so the DAG also runs in a plain (non-docker) Airflow environment.
 requests>=2.31,<3
-apache-airflow~=3.2.0
+apache-airflow~=3.1.0
 pandas>=2.2,<3
 scikit-learn>=1.5,<2
 joblib>=1.4,<2
