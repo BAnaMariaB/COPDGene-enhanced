@@ -4,6 +4,8 @@ import os
 from dataclasses import dataclass
 from typing import Any
 
+from psycopg2.extras import Json
+
 
 def _normalize_pg_url(url: str) -> str:
     # Allow SQLAlchemy-style URLs in env vars.
@@ -57,6 +59,23 @@ CREATE INDEX IF NOT EXISTS champion_models_active_idx
   WHERE is_active;
 """
 
+PIPELINE_EVENT_DDL = """
+CREATE TABLE IF NOT EXISTS pipeline_events (
+  id BIGSERIAL PRIMARY KEY,
+  pipeline_name TEXT NOT NULL,
+  event_type TEXT NOT NULL,
+  model_name TEXT,
+  target TEXT,
+  run_id TEXT,
+  logical_date DATE,
+  status TEXT NOT NULL,
+  details_json JSONB,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS pipeline_events_latest_idx
+  ON pipeline_events(pipeline_name, event_type, created_at DESC);
+"""
+
 
 def connect():
     import psycopg2
@@ -68,9 +87,14 @@ def connect():
 
 
 def ensure_schema(conn) -> None:
-    conn.autocommit = True
-    with conn.cursor() as cur:
-        cur.execute(DDL)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(DDL)
+            cur.execute(PIPELINE_EVENT_DDL)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
 
 
 def upsert_active_champion(
@@ -90,42 +114,87 @@ def upsert_active_champion(
 ) -> int:
     """Deactivate previous active row and insert the new champion as active."""
     ensure_schema(conn)
-    conn.autocommit = False
-    with conn.cursor() as cur:
-        cur.execute(
-            "UPDATE champion_models SET is_active=FALSE WHERE model_name=%s AND target=%s AND is_active=TRUE",
-            (model_name, target),
-        )
-        cur.execute(
-            """
-            INSERT INTO champion_models (
-              model_name, target,
-              mlflow_tracking_uri, mlflow_experiment_name,
-              mlflow_run_id, artifact_uri,
-              model_artifact_path, preprocessing_artifact_path,
-              metric_name, metric_value, params_json,
-              is_active
-            ) VALUES (
-              %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,TRUE
-            ) RETURNING id
-            """,
-            (
-                model_name,
-                target,
-                mlflow_tracking_uri,
-                mlflow_experiment_name,
-                mlflow_run_id,
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE champion_models SET is_active=FALSE WHERE model_name=%s AND target=%s AND is_active=TRUE",
+                (model_name, target),
+            )
+            cur.execute(
+                """
+                INSERT INTO champion_models (
+                  model_name, target,
+                  mlflow_tracking_uri, mlflow_experiment_name,
+                  mlflow_run_id, artifact_uri,
+                  model_artifact_path, preprocessing_artifact_path,
+                  metric_name, metric_value, params_json,
+                  is_active
+                ) VALUES (
+                  %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,TRUE
+                ) RETURNING id
+                """,
+                (
+                    model_name,
+                    target,
+                    mlflow_tracking_uri,
+                    mlflow_experiment_name,
+                    mlflow_run_id,
                 artifact_uri,
                 model_artifact_path,
                 preprocessing_artifact_path,
                 metric_name,
                 metric_value,
-                params_json,
+                Json(params_json) if params_json is not None else None,
             ),
         )
-        new_id = int(cur.fetchone()[0])
-    conn.commit()
-    return new_id
+            new_id = int(cur.fetchone()[0])
+        conn.commit()
+        return new_id
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def upsert_pipeline_event(
+    conn,
+    *,
+    pipeline_name: str,
+    event_type: str,
+    status: str,
+    model_name: str | None = None,
+    target: str | None = None,
+    run_id: str | None = None,
+    logical_date: str | None = None,
+    details_json: dict[str, Any] | None = None,
+) -> int:
+    ensure_schema(conn)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO pipeline_events (
+                  pipeline_name, event_type, model_name, target,
+                  run_id, logical_date, status, details_json
+                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+                RETURNING id
+                """,
+                (
+                    pipeline_name,
+                    event_type,
+                    model_name,
+                    target,
+                    run_id,
+                    logical_date,
+                    status,
+                    Json(details_json) if details_json is not None else None,
+                ),
+            )
+            new_id = int(cur.fetchone()[0])
+        conn.commit()
+        return new_id
+    except Exception:
+        conn.rollback()
+        raise
 
 
 def fetch_active_champion(conn, *, model_name: str, target: str) -> ChampionRow | None:

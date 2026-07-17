@@ -1,3 +1,12 @@
+FROM node:22-slim AS frontend
+WORKDIR /app/serving/ui
+
+COPY serving/ui/package.json /app/serving/ui/package.json
+RUN npm install
+
+COPY serving/ui /app/serving/ui
+RUN npm run build
+
 FROM python:3.11-slim
 
 WORKDIR /app
@@ -6,8 +15,10 @@ COPY requirements-serving.txt /app/requirements-serving.txt
 RUN pip install --no-cache-dir -r /app/requirements-serving.txt
 
 COPY serving /app/serving
+COPY --from=frontend /app/serving/ui/dist /app/serving/dist
 
 ENV PORT=7860
+ENV UI_DIST_DIR=/app/serving/dist
 EXPOSE 7860
 
 CMD ["python", "-m", "serving.ui.app"]

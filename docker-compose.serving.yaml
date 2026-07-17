@@ -22,9 +22,27 @@ services:
       CHAMPION_MODEL_NAME: ${CHAMPION_MODEL_NAME:-copd_double_target_system}
       CHAMPION_MODEL_TARGET: ${CHAMPION_MODEL_TARGET:-system}
       MODEL_CACHE_DIR: /tmp/copd_champion_cache
+      INGESTION_DAG_ID: ${INGESTION_DAG_ID:-copd_ingestion}
+      TRAINING_DAG_ID: ${TRAINING_DAG_ID:-copd_train_validate_test}
+      AIRFLOW_API_URL: ${AIRFLOW_API_URL:-}
+      AIRFLOW_API_USERNAME: ${AIRFLOW_API_USERNAME:-}
+      AIRFLOW_API_PASSWORD: ${AIRFLOW_API_PASSWORD:-}
+      AIRFLOW_CLI_BIN: ${AIRFLOW_CLI_BIN:-/home/xenderochefort/airflow/airflow_venv/bin/airflow}
+      AIRFLOW_HOME: /workspace/airflow_home_compose
+      AIRFLOW__CORE__DAGS_FOLDER: /workspace/airflow/dags
+      AIRFLOW_DAGS_SUBDIR: /workspace/airflow/dags
+      AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+      COPD_PREPROCESSED_ROOT: /workspace/data/preprocessed
+      COPD_ARTIFACT_ROOT: /workspace/data/artifacts
     depends_on:
       postgres:
         condition: service_healthy
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./:/workspace:z
+      - /home/xenderochefort/airflow:/home/xenderochefort/airflow:ro,z
+      - /home/xenderochefort/.local:/home/xenderochefort/.local:ro,z
     ports:
       - "8000:8000"
 
@@ -37,5 +55,7 @@ services:
       PORT: 7860
     depends_on:
       - api
+    volumes:
+      - ./:/workspace
     ports:
       - "7860:7860"

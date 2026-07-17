@@ -460,6 +460,26 @@ def copd_ingestion():
     @task
     def ingestion_complete(preprocessing_artifacts_path: str) -> None:
         """Final marker task for downstream dependencies."""
+        try:
+            from airflow.sdk import get_current_context
+            from serving.common.champion_registry import connect as db_connect
+            from serving.common.champion_registry import upsert_pipeline_event
+
+            registry_url = os.environ.get("CHAMPION_REGISTRY_DATABASE_URL", "").strip()
+            if registry_url:
+                context = get_current_context()
+                with db_connect() as conn:
+                    upsert_pipeline_event(
+                        conn,
+                        pipeline_name="copd_ingestion",
+                        event_type="completion",
+                        status="success",
+                        run_id=str(context.get("run_id")),
+                        logical_date=str(context.get("ds")),
+                        details_json={"preprocessing_artifacts_path": preprocessing_artifacts_path},
+                    )
+        except Exception as exc:  # noqa: BLE001
+            print(f"[ingestion_registry] skipped: {exc}")
         print(f"[preprocess] artifacts saved at {preprocessing_artifacts_path}")
 
     start_task = start()
