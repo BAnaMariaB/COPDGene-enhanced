@@ -1,0 +1,13 @@
+# Airflow for LOCAL dev only (editing/parsing/linting DAGs). NOT needed in Docker —
+# the apache/airflow image already ships it, and NOT in uv.lock — Airflow's huge
+# dependency tree is kept out of the project lock on purpose (see pyproject.toml).
+#
+# Install it into your uv venv AFTER `uv sync`, using Apache's constraints file:
+#   export AIRFLOW_VERSION=3.3.0 PYTHON_VERSION=3.11
+#   uv pip install "apache-airflow==${AIRFLOW_VERSION}" \
+#     --constraint "https://raw.githubusercontent.com/apache/airflow/constraints-${AIRFLOW_VERSION}/constraints-${PYTHON_VERSION}.txt"
+#
+# The DAGs use the Airflow 3 Task SDK (`from airflow.sdk import dag, task`), so
+# Airflow 3.x is required — `airflow.sdk` does not exist in 2.x.
+# (ruff and other locked dev tools live in pyproject.toml's [dependency-groups] dev.)
+apache-airflow==3.3.0

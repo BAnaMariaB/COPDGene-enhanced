@@ -1,0 +1,32 @@
+[
+  {
+    "name": "former_smoker_middle_age",
+    "payload": {
+      "age": 58,
+      "sex": 1,
+      "race_ethnicity": 3,
+      "height_cm": 172,
+      "weight_kg": 82,
+      "bmi": 27.7,
+      "pack_years": 20,
+      "smoking_status": "former",
+      "fev1_ml": 2100,
+      "fvc_ml": 3200
+    }
+  },
+  {
+    "name": "current_smoker_older_adult",
+    "payload": {
+      "age": 67,
+      "sex": 0,
+      "race_ethnicity": 2,
+      "height_cm": 165,
+      "weight_kg": 74,
+      "bmi": 27.2,
+      "pack_years": 35,
+      "smoking_status": "current",
+      "fev1_ml": 1450,
+      "fvc_ml": 2450
+    }
+  }
+]

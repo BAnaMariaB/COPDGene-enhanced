@@ -1,0 +1,3 @@
+age,sex,race_ethnicity,height_cm,weight_kg,bmi,pack_years,smoking_status,fev1_ml,fvc_ml
+58,1,3,172,82,27.7,20,former,2100,3200
+67,0,2,165,74,27.2,35,current,1450,2450
